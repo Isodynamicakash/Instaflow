@@ -1,54 +1,49 @@
 """
-InstaFlow — Configuration
-Loads all environment variables and provides app-wide settings.
-Updated for Zernio API integration.
+Configuration management for InstaFlow
 """
 
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
+from pydantic_settings import BaseSettings
+from pydantic import Field, field_validator
 
 
-class Settings:
-    # ── Zernio (New - Primary) ──
-    ZERNIO_API_KEY: str = os.getenv("ZERNIO_API_KEY", "")
-    ZERNIO_WEBHOOK_SECRET: str = os.getenv("ZERNIO_WEBHOOK_SECRET", "instaflow_verify_2024")
-    ZERNIO_API_BASE: str = "https://api.zernio.com/v1"
+class Settings(BaseSettings):
+    """Application settings loaded from environment variables."""
 
-    # ── Instagram (Legacy - Graph API, kept for compatibility) ──
-    IG_ACCESS_TOKEN: str = os.getenv("IG_ACCESS_TOKEN", "")
-    IG_USER_ID: str = os.getenv("IG_USER_ID", "")
-    META_APP_ID: str = os.getenv("META_APP_ID", "")
-    META_APP_SECRET: str = os.getenv("META_APP_SECRET", "")
-    IG_WEBHOOK_VERIFY_TOKEN: str = os.getenv("IG_WEBHOOK_VERIFY_TOKEN", "instaflow_verify_2024")
+    # Instagram API
+    IG_USER_ID: str = Field(default="", description="Instagram User ID")
+    IG_ACCESS_TOKEN: str = Field(default="", description="Instagram Access Token")
+    IG_API_BASE: str = Field(
+        default="https://graph.instagram.com/v21.0",
+        description="Instagram Graph API base URL"
+    )
 
-    # LLM
-    ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
-    CLAUDE_MODEL: str = "claude-sonnet-4-6"
+    # Zernio Webhook
+    ZERNIO_API_KEY: str = Field(default="", description="Zernio API key")
+    ZERNIO_WEBHOOK_SECRET: str = Field(default="", description="Zernio webhook secret")
 
-    # WhatsApp (Phase 2)
-    WA_PHONE_NUMBER_ID: str = os.getenv("WA_PHONE_NUMBER_ID", "")
-    WA_ACCESS_TOKEN: str = os.getenv("WA_ACCESS_TOKEN", "")
-    WA_WEBHOOK_VERIFY_TOKEN: str = os.getenv("WA_WEBHOOK_VERIFY_TOKEN", "instaflow_wa_verify")
+    # Anthropic
+    ANTHROPIC_API_KEY: str = Field(default="", description="Anthropic API key")
+    CLAUDE_MODEL: str = Field(
+        default="claude-3-5-sonnet-20241022",
+        description="Claude model to use"
+    )
 
-    # Supabase (Phase 2)
-    SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
-    SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")
+    # Environment
+    ENV: str = Field(default="development", description="Environment (development/production)")
+    DEBUG: bool = Field(default=False, description="Debug mode")
 
-    # Server
-    PORT: int = int(os.getenv("PORT", "8000"))
-    ENV: str = os.getenv("ENV", "development")
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
 
-    # Instagram Graph API (Legacy)
-    IG_API_BASE: str = "https://graph.instagram.com/v21.0"
-    FB_API_BASE: str = "https://graph.facebook.com/v21.0"
-
-    # Railguard defaults
-    MAX_REPLIES_PER_HOUR: int = 30
-    MIN_FOLLOWER_COUNT: int = 5
-    COOLDOWN_MINUTES: int = 30
-    SENTIMENT_ESCALATION_THRESHOLD: float = 0.7
+    @field_validator("ANTHROPIC_API_KEY", "IG_ACCESS_TOKEN", "ZERNIO_API_KEY", 
+                     "ZERNIO_WEBHOOK_SECRET", mode="before")
+    @classmethod
+    def strip_whitespace(cls, v):
+        """Strip leading/trailing whitespace from API keys."""
+        if isinstance(v, str):
+            return v.strip()
+        return v
 
 
 settings = Settings()
