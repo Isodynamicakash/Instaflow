@@ -24,7 +24,7 @@ def build_engagement_graph():
 
     llm = ChatAnthropic(
         model=settings.CLAUDE_MODEL,
-        api_key=settings.ANTHROPIC_API_KEY,
+        
         temperature=0.7,
     )
 
