@@ -7,3 +7,4 @@ langgraph==0.0.21
 langchain-anthropic==0.0.2
 gunicorn==21.2.0
 python-dotenv==1.0.0
+pydantic-settings==2.0.3
