@@ -44,11 +44,14 @@ class InstagramAPI:
 
     async def send_dm(self, user_id: str, message_text: str) -> dict:
         """
-        Send DM to user via Zernio CREATE CONVERSATION endpoint
-        Uses CORRECT Zernio accountId format!
+        Send DM to user via Zernio SEND MESSAGE endpoint
+        For Instagram DMs - uses existing conversation
         """
         try:
-            url = f"{self.zernio_api_base}/inbox/conversations"
+            # For Instagram: conversationId = user's Instagram ID
+            conversation_id = user_id
+            
+            url = f"{self.zernio_api_base}/inbox/conversations/{conversation_id}/messages"
             
             headers = {
                 "Authorization": f"Bearer {self.zernio_api_key}",
@@ -56,8 +59,7 @@ class InstagramAPI:
             }
             
             payload = {
-                "accountId": self.zernio_account_id,  # Use Zernio's account ID!
-                "participantId": user_id,
+                "accountId": self.zernio_account_id,  # Use correct Zernio account ID!
                 "message": message_text,
             }
             
