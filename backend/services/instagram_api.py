@@ -43,14 +43,11 @@ class InstagramAPI:
 
     async def send_dm(self, user_id: str, message_text: str) -> dict:
         """
-        Send DM to user via Zernio API
-        Uses Zernio's unified messaging API (no more 403 errors!)
+        Send DM to user via Zernio CREATE CONVERSATION endpoint
+        Auto-handles account mapping - more reliable than Send to existing!
         """
         try:
-            # Zernio conversation ID is the user's Instagram ID
-            conversation_id = user_id
-            
-            url = f"{self.zernio_api_base}/inbox/conversations/{conversation_id}/messages"
+            url = f"{self.zernio_api_base}/inbox/conversations"
             
             headers = {
                 "Authorization": f"Bearer {self.zernio_api_key}",
@@ -59,11 +56,11 @@ class InstagramAPI:
             
             payload = {
                 "accountId": self.ig_user_id,
+                "participantId": user_id,
                 "message": message_text,
             }
             
             logger.info(f"📤 Sending DM via Zernio to {user_id}...")
-            logger.info(f"   URL: {url}")
             logger.info(f"   Message: {message_text}")
             
             response = await self.http_client.post(url, json=payload, headers=headers)
