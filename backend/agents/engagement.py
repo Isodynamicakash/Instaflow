@@ -1,12 +1,11 @@
-# backend/agents/engagement.py
 """
 Engagement Monitor Graph — 24/7 agent that handles incoming comments.
 Classifies intent, auto-replies, sends DMs, escalates serious messages.
 
-UPDATED: No database calls - works standalone
+FIXED: Works with langgraph 0.0.21 (uses set_entry_point instead of START)
 """
 
-from langgraph.graph import StateGraph, END, START
+from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -212,7 +211,9 @@ def build_engagement_graph():
     graph.add_node("handle_escalation", handle_escalation)
     graph.add_node("handle_spam", handle_spam)
 
-    graph.add_edge(START, "classify_intent")
+    # ✅ Use set_entry_point instead of START (works with langgraph 0.0.21)
+    graph.set_entry_point("classify_intent")
+    
     graph.add_conditional_edges(
         "classify_intent",
         route_by_intent,
