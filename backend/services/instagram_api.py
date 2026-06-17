@@ -18,6 +18,7 @@ class InstagramAPI:
         self.ig_api_base = settings.IG_API_BASE
         self.zernio_api_base = "https://zernio.com/api/v1"
         self.zernio_api_key = settings.ZERNIO_API_KEY
+        self.zernio_account_id = settings.ZERNIO_ACCOUNT_ID
         self.http_client = httpx.AsyncClient()
 
     async def reply_to_comment(self, comment_id: str, reply_text: str) -> dict:
@@ -44,7 +45,7 @@ class InstagramAPI:
     async def send_dm(self, user_id: str, message_text: str) -> dict:
         """
         Send DM to user via Zernio CREATE CONVERSATION endpoint
-        Auto-handles account mapping - more reliable than Send to existing!
+        Uses CORRECT Zernio accountId format!
         """
         try:
             url = f"{self.zernio_api_base}/inbox/conversations"
@@ -55,7 +56,7 @@ class InstagramAPI:
             }
             
             payload = {
-                "accountId": self.ig_user_id,
+                "accountId": self.zernio_account_id,  # Use Zernio's account ID!
                 "participantId": user_id,
                 "message": message_text,
             }
