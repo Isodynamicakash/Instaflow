@@ -1,6 +1,5 @@
 {
   "build": {
-    "builder": "nixpacks",
-    "nixpacksToml": "nixpacks.toml"
+    "builder": "nixpacks"
   }
 }
