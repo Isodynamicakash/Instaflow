@@ -2,48 +2,33 @@
 Configuration management for InstaFlow
 """
 
+import os
 from pydantic_settings import BaseSettings
-from pydantic import Field, field_validator
 
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
     # Instagram API
-    IG_USER_ID: str = Field(default="", description="Instagram User ID")
-    IG_ACCESS_TOKEN: str = Field(default="", description="Instagram Access Token")
-    IG_API_BASE: str = Field(
-        default="https://graph.instagram.com/v21.0",
-        description="Instagram Graph API base URL"
-    )
+    IG_USER_ID: str = os.getenv("IG_USER_ID", "").strip()
+    IG_ACCESS_TOKEN: str = os.getenv("IG_ACCESS_TOKEN", "").strip()
+    IG_API_BASE: str = os.getenv("IG_API_BASE", "https://graph.instagram.com/v21.0").strip()
 
     # Zernio Webhook
-    ZERNIO_API_KEY: str = Field(default="", description="Zernio API key")
-    ZERNIO_WEBHOOK_SECRET: str = Field(default="", description="Zernio webhook secret")
+    ZERNIO_API_KEY: str = os.getenv("ZERNIO_API_KEY", "").strip()
+    ZERNIO_WEBHOOK_SECRET: str = os.getenv("ZERNIO_WEBHOOK_SECRET", "").strip()
 
     # Anthropic
-    ANTHROPIC_API_KEY: str = Field(default="", description="Anthropic API key")
-    CLAUDE_MODEL: str = Field(
-        default="claude-3-5-sonnet-20241022",
-        description="Claude model to use"
-    )
+    ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-opus-4-1").strip()
 
     # Environment
-    ENV: str = Field(default="development", description="Environment (development/production)")
-    DEBUG: bool = Field(default=False, description="Debug mode")
+    ENV: str = os.getenv("ENV", "development").strip()
+    DEBUG: bool = os.getenv("DEBUG", "false").lower() == "true"
 
     class Config:
         env_file = ".env"
         case_sensitive = True
-
-    @field_validator("ANTHROPIC_API_KEY", "IG_ACCESS_TOKEN", "ZERNIO_API_KEY", 
-                     "ZERNIO_WEBHOOK_SECRET", mode="before")
-    @classmethod
-    def strip_whitespace(cls, v):
-        """Strip leading/trailing whitespace from API keys."""
-        if isinstance(v, str):
-            return v.strip()
-        return v
 
 
 settings = Settings()
