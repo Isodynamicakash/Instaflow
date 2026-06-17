@@ -2,14 +2,12 @@
 Engagement Monitor Graph — 24/7 agent that handles incoming comments.
 Classifies intent, auto-replies, sends DMs, escalates serious messages.
 
-FIXED: Works with langgraph 0.0.21 (uses set_entry_point instead of START)
+FIXED: Uses Anthropic SDK directly (no langchain dependency hell)
 """
 
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
-from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import HumanMessage, SystemMessage
-
+import anthropic
 from backend.config import settings
 from backend.agents.states import EngagementState
 from backend.agents.prompts import INTENT_CLASSIFIER, ENGAGEMENT_REPLY
@@ -22,11 +20,7 @@ logger = logging.getLogger(__name__)
 def build_engagement_graph():
     """Build and compile the engagement monitor graph."""
 
-    llm = ChatAnthropic(
-        model=settings.CLAUDE_MODEL,
-        
-        temperature=0.7,
-    )
+    client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
 
     async def classify_intent(state: EngagementState) -> dict:
         """
@@ -49,16 +43,23 @@ def build_engagement_graph():
         # LLM classification
         logger.info(f"🤖 Classifying intent with Claude...")
         
-        response = await llm.ainvoke([
-            SystemMessage(content=INTENT_CLASSIFIER),
-            HumanMessage(content=(
-                f"Type: {state['event_type']}\n"
-                f"From: @{state['sender_username']}\n"
-                f"Message: {state['text']}"
-            )),
-        ])
+        response = client.messages.create(
+            model=settings.CLAUDE_MODEL,
+            max_tokens=100,
+            system=INTENT_CLASSIFIER,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        f"Type: {state['event_type']}\n"
+                        f"From: @{state['sender_username']}\n"
+                        f"Message: {state['text']}"
+                    ),
+                }
+            ],
+        )
 
-        intent = response.content.strip().lower().replace(" ", "_")
+        intent = response.content[0].text.strip().lower().replace(" ", "_")
         valid = {"genuine_praise", "question", "serious_inquiry",
                  "complaint", "spam", "conversation"}
         if intent not in valid:
@@ -139,16 +140,23 @@ def build_engagement_graph():
         )
 
         # Generate reply with Claude
-        response = await llm.ainvoke([
-            SystemMessage(content=prompt),
-            HumanMessage(content=(
-                f"Someone said:\n"
-                f'"@{state["sender_username"]}: {state["text"]}"\n\n'
-                f"Write a natural, engaging reply. Just the reply text, no quotes."
-            )),
-        ])
+        response = client.messages.create(
+            model=settings.CLAUDE_MODEL,
+            max_tokens=200,
+            system=prompt,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        f"Someone said:\n"
+                        f'"@{state["sender_username"]}: {state["text"]}"\n\n'
+                        f"Write a natural, engaging reply. Just the reply text, no quotes."
+                    ),
+                }
+            ],
+        )
 
-        reply_text = response.content.strip().strip('"').strip("'")
+        reply_text = response.content[0].text.strip().strip('"').strip("'")
         logger.info(f"   Generated: {reply_text[:60]}...")
 
         # Post reply
