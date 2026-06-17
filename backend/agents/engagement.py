@@ -7,7 +7,7 @@ FIXED: Works with langgraph 0.0.21 (uses set_entry_point instead of START)
 
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
-from langchain.chat_models import ChatAnthropic
+from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from backend.config import settings
