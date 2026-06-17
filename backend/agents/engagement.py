@@ -2,7 +2,7 @@
 Engagement Monitor Graph — 24/7 agent that handles incoming comments.
 Classifies intent, auto-replies, sends DMs, escalates serious messages.
 
-FIXED: Uses Anthropic SDK directly (no langchain dependency hell)
+FIXED: Only GENERATES responses, webhook handles posting (no duplicates!)
 """
 
 from langgraph.graph import StateGraph, END
@@ -11,7 +11,6 @@ import anthropic
 from backend.config import settings
 from backend.agents.states import EngagementState
 from backend.agents.prompts import INTENT_CLASSIFIER, ENGAGEMENT_REPLY
-from backend.services.instagram_api import InstagramAPI
 import logging
 
 logger = logging.getLogger(__name__)
@@ -85,12 +84,12 @@ def build_engagement_graph():
 
     async def handle_trigger(state: EngagementState) -> dict:
         """
-        Trigger word detected: reply publicly + send DM with link
+        Trigger word detected: generate reply + DM text
+        (Webhook will handle posting)
         """
         logger.info(f"🎯 Handling trigger word...")
         
         rule = state["matched_rule"]
-        api = InstagramAPI(state["access_token"], state["ig_user_id"])
 
         comment_reply = rule.get("comment_reply", "Check your DMs! 📩")
         dm_text = rule.get("dm_template", "Here's what you asked for!")
@@ -99,39 +98,22 @@ def build_engagement_graph():
         for key, value in rule.get("dm_payload", {}).items():
             dm_text = dm_text.replace(f"{{{key}}}", str(value))
 
-        actions = []
-
-        # Reply to comment
-        if state.get("comment_id"):
-            try:
-                await api.reply_to_comment(state["comment_id"], comment_reply)
-                actions.append("comment_replied")
-                logger.info(f"   ✅ Comment replied")
-            except Exception as e:
-                logger.error(f"   ❌ Comment reply failed: {e}")
-
-        # Send DM
-        if state.get("sender_id"):
-            try:
-                await api.send_dm(state["sender_id"], dm_text)
-                actions.append("dm_sent")
-                logger.info(f"   ✅ DM sent")
-            except Exception as e:
-                logger.error(f"   ❌ DM failed: {e}")
+        logger.info(f"   Comment reply: {comment_reply}")
+        logger.info(f"   DM text: {dm_text}")
 
         return {
             "response_text": comment_reply,
-            "action_taken": "trigger_" + "_".join(actions),
+            "dm_text": dm_text,
+            "action_taken": "trigger_matched",
         }
 
     async def handle_reply(state: EngagementState) -> dict:
         """
-        Generate and post contextual AI reply for praise/questions/general comments
+        Generate contextual AI reply for praise/questions/general comments
+        (Webhook will handle posting)
         """
         logger.info(f"💬 Generating contextual reply...")
         
-        api = InstagramAPI(state["access_token"], state["ig_user_id"])
-
         # Build prompt
         prompt = ENGAGEMENT_REPLY.format(
             username=state.get("ig_username", ""),
@@ -159,20 +141,6 @@ def build_engagement_graph():
         reply_text = response.content[0].text.strip().strip('"').strip("'")
         logger.info(f"   Generated: {reply_text[:60]}...")
 
-        # Post reply
-        if state["event_type"] == "comment" and state.get("comment_id"):
-            try:
-                await api.reply_to_comment(state["comment_id"], reply_text)
-                logger.info(f"   ✅ Posted to comment")
-            except Exception as e:
-                logger.error(f"   ❌ Failed to post: {e}")
-        elif state["event_type"] == "dm" and state.get("sender_id"):
-            try:
-                await api.send_dm(state["sender_id"], reply_text)
-                logger.info(f"   ✅ Sent as DM")
-            except Exception as e:
-                logger.error(f"   ❌ Failed to send DM: {e}")
-
         return {
             "response_text": reply_text,
             "action_taken": f"auto_reply_{state['event_type']}",
@@ -180,22 +148,13 @@ def build_engagement_graph():
 
     async def handle_escalation(state: EngagementState) -> dict:
         """
-        Serious message detected: send holding reply.
-        (In future: forward to WhatsApp)
+        Serious message detected: generate holding reply
+        (Webhook will handle posting)
         """
         logger.info(f"⚠️  Handling escalation (serious/complaint)...")
-        
-        api = InstagramAPI(state["access_token"], state["ig_user_id"])
 
-        # Send holding reply
         holding = "Thanks for reaching out! Our team will get back to you shortly 🙏"
-        
-        if state["event_type"] == "comment" and state.get("comment_id"):
-            try:
-                await api.reply_to_comment(state["comment_id"], holding)
-                logger.info(f"   ✅ Holding reply posted")
-            except Exception as e:
-                logger.error(f"   ❌ Failed to post holding reply: {e}")
+        logger.info(f"   Holding reply: {holding}")
 
         return {
             "response_text": holding,
