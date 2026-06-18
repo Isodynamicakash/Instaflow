@@ -1,11 +1,9 @@
 """
-InstaFlow — Complete Main Server with Advanced Analytics
-Webhooks + Dashboard API + Real Analytics + Hashtags + Best Times + Demographics
-Run: uvicorn backend.main:app --reload --port 8000
-Deploy: Railway
+InstaFlow — Complete Main Server with DM Support
+Webhooks + Dashboard API + DMs + Schedule Posts
 """
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, WebSocket, HTTPException
+from fastapi import FastAPI, WebSocket, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import logging
@@ -14,11 +12,10 @@ import httpx
 from anthropic import Anthropic
 from datetime import datetime
 from collections import defaultdict
+import os
 
 from backend.config import settings
 from backend.webhooks.instagram import router as ig_webhook_router
-
-# ==================== LOGGING ====================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,6 +33,8 @@ class SchedulePostRequest(BaseModel):
 
 class CaptionRequest(BaseModel):
     prompt: str
+    topic: str = ""
+    writing_style: str = ""
 
 class HashtagsRequest(BaseModel):
     topic: str
@@ -50,7 +49,6 @@ class InstagramAPI:
         self.client = httpx.AsyncClient()
 
     async def get_posts(self):
-        """Get user's recent posts with engagement metrics"""
         try:
             url = f"{self.api_base}/{self.user_id}/media"
             params = {
@@ -67,12 +65,11 @@ class InstagramAPI:
             return []
 
     async def get_comments(self):
-        """Get recent comments from user's posts"""
         try:
             posts = await self.get_posts()
             all_comments = []
             
-            for post in posts[:5]:  # Check last 5 posts
+            for post in posts[:5]:
                 url = f"{self.api_base}/{post['id']}/comments"
                 params = {
                     "fields": "id,from,text,timestamp",
@@ -83,17 +80,29 @@ class InstagramAPI:
                     comments = response.json().get("data", [])
                     all_comments.extend(comments)
             
-            logger.info(f"✅ Fetched {len(all_comments)} comments from Instagram")
+            logger.info(f"✅ Fetched {len(all_comments)} comments")
             return all_comments
         except Exception as e:
             logger.error(f"❌ Failed to get comments: {e}")
             return []
 
+    async def get_conversations(self):
+        """Get DM conversations"""
+        try:
+            url = f"{settings.ZERNIO_API_BASE}/v1/inbox/conversations"
+            headers = {"Authorization": f"Bearer {settings.ZERNIO_API_KEY}"}
+            response = await self.client.get(url, headers=headers, timeout=10.0)
+            response.raise_for_status()
+            data = response.json()
+            logger.info(f"✅ Fetched DM conversations")
+            return data.get("data", [])
+        except Exception as e:
+            logger.error(f"❌ Failed to get conversations: {e}")
+            return []
+
     async def close(self):
-        """Close HTTP client"""
         await self.client.aclose()
 
-# Initialize Instagram API
 ig_api = InstagramAPI(
     settings.IG_ACCESS_TOKEN,
     settings.IG_USER_ID,
@@ -104,29 +113,14 @@ ig_api = InstagramAPI(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     logger.info("="*70)
     logger.info("🚀 InstaFlow Agent — Server Started")
     logger.info(f"   Environment: {settings.ENV}")
-    logger.info(f"   IG User ID: {settings.IG_USER_ID or '(not set)'}")
-    logger.info(f"   Claude Model: {settings.CLAUDE_MODEL}")
-    logger.info(f"   Endpoints:")
-    logger.info(f"      POST /webhook/instagram (Webhooks)")
-    logger.info(f"      GET  /analytics (Dashboard)")
-    logger.info(f"      GET  /analytics/hashtags (Top hashtags)")
-    logger.info(f"      GET  /analytics/best-time (Best hours & days)")
-    logger.info(f"      GET  /analytics/demographics (Audience)")
-    logger.info(f"      POST /posts/schedule")
-    logger.info(f"      GET  /posts/scheduled")
-    logger.info(f"      GET  /comments")
-    logger.info(f"      POST /ai/caption")
-    logger.info(f"      POST /ai/hashtags")
-    logger.info(f"      WS   /ws/analytics")
+    logger.info(f"   Endpoints: 10+ available")
     logger.info("="*70)
     
     yield
     
-    # Shutdown
     await ig_api.close()
     logger.info("🛑 InstaFlow Agent — Server Stopped")
 
@@ -139,8 +133,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ==================== MIDDLEWARE ====================
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -149,67 +141,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==================== WEBHOOKS (EXISTING) ====================
-
-# Include all webhook routes from instagram.py
 app.include_router(ig_webhook_router)
 
-# ==================== HEALTH & ROOT ====================
+# ==================== ROOT & HEALTH ====================
 
 @app.get("/")
 async def root():
-    """Health check"""
     return {
         "name": "InstaFlow Agent",
         "version": "1.0.0",
         "status": "running",
-        "environment": settings.ENV,
-        "timestamp": datetime.now().isoformat(),
-        "endpoints": {
-            "root": "/",
-            "health": "/health",
-            "webhook": "/webhook/instagram",
-            "dashboard": {
-                "analytics": "/analytics",
-                "hashtags": "/analytics/hashtags",
-                "best_time": "/analytics/best-time",
-                "demographics": "/analytics/demographics",
-                "schedule": "/posts/schedule",
-                "scheduled": "/posts/scheduled",
-                "comments": "/comments",
-                "ai_caption": "/ai/caption",
-                "ai_hashtags": "/ai/hashtags",
-                "websocket": "/ws/analytics"
-            },
-            "docs": "/docs"
-        }
+        "endpoints": [
+            "GET /analytics",
+            "GET /analytics/hashtags",
+            "GET /analytics/best-time",
+            "GET /analytics/demographics",
+            "GET /comments (+ DMs)",
+            "GET /dms",
+            "POST /posts/schedule",
+            "POST /ai/caption",
+            "POST /ai/hashtags",
+            "POST /media/upload",
+            "WS /ws/analytics"
+        ]
     }
 
 @app.get("/health")
 async def health():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "service": "instaflow",
-        "version": "1.0.0",
-        "timestamp": datetime.utcnow().isoformat(),
-        "environment": settings.ENV
-    }
+    return {"status": "healthy", "service": "instaflow"}
 
 # ==================== ANALYTICS ====================
 
 @app.get("/analytics")
 async def get_analytics():
-    """Get real analytics from Instagram API
-    Returns posts data with engagement metrics for dashboard charts
-    """
     try:
         posts = await ig_api.get_posts()
         
         total_likes = sum(p.get("like_count", 0) for p in posts)
         total_comments = sum(p.get("comments_count", 0) for p in posts)
         
-        # Format posts data for charts (THIS IS THE FIX!)
         posts_data = [
             {
                 "id": p.get("id"),
@@ -227,7 +197,7 @@ async def get_analytics():
             "totalPosts": len(posts),
             "totalLikes": total_likes,
             "totalComments": total_comments,
-            "recentEngagement": posts_data  # Real post data for charts!
+            "recentEngagement": posts_data
         }
     except Exception as e:
         logger.error(f"❌ Analytics error: {e}")
@@ -238,11 +208,10 @@ async def get_analytics():
             "recentEngagement": []
         }
 
-# ==================== TOP PERFORMING HASHTAGS ====================
+# ==================== HASHTAGS ====================
 
 @app.get("/analytics/hashtags")
 async def get_top_hashtags():
-    """Get top performing hashtags from your captions"""
     try:
         posts = await ig_api.get_posts()
         hashtag_performance = {}
@@ -264,14 +233,12 @@ async def get_top_hashtags():
                 hashtag_performance[hashtag]["total_likes"] += post.get("like_count", 0)
                 hashtag_performance[hashtag]["total_comments"] += post.get("comments_count", 0)
         
-        # Calculate averages and sort
         for tag in hashtag_performance:
             count = hashtag_performance[tag]["count"]
             hashtag_performance[tag]["avg_engagement"] = (
                 (hashtag_performance[tag]["total_likes"] + hashtag_performance[tag]["total_comments"]) / count
             ) if count > 0 else 0
         
-        # Sort by engagement
         top_hashtags = sorted(
             hashtag_performance.items(),
             key=lambda x: x[1]["avg_engagement"],
@@ -297,11 +264,10 @@ async def get_top_hashtags():
         logger.error(f"❌ Hashtags error: {e}")
         return {"hashtags": [], "total_unique": 0}
 
-# ==================== BEST TIME TO PUBLISH ====================
+# ==================== BEST TIME ====================
 
 @app.get("/analytics/best-time")
 async def get_best_publishing_time():
-    """Get best times to publish based on engagement"""
     try:
         posts = await ig_api.get_posts()
         
@@ -313,7 +279,6 @@ async def get_best_publishing_time():
             if not timestamp:
                 continue
             
-            # Parse timestamp: 2026-06-17T14:49:19+0000
             try:
                 post_time = datetime.fromisoformat(timestamp.replace("+0000", "+00:00"))
                 hour = post_time.hour
@@ -329,7 +294,6 @@ async def get_best_publishing_time():
             except:
                 continue
         
-        # Calculate averages
         best_hours = []
         for hour in sorted(time_performance.keys()):
             data = time_performance[hour]
@@ -352,7 +316,6 @@ async def get_best_publishing_time():
                     "posts": data["count"]
                 })
         
-        # Get top 3
         top_hours = sorted(best_hours, key=lambda x: x["engagement"], reverse=True)[:3]
         top_days = sorted(best_days, key=lambda x: x["engagement"], reverse=True)[:3]
         
@@ -368,13 +331,11 @@ async def get_best_publishing_time():
         logger.error(f"❌ Best time error: {e}")
         return {"best_hours": [], "best_days": [], "all_hours": [], "all_days": []}
 
-# ==================== AUDIENCE DEMOGRAPHICS ====================
+# ==================== DEMOGRAPHICS ====================
 
 @app.get("/analytics/demographics")
 async def get_user_demographics():
-    """Get follower demographics (requires business account)"""
     try:
-        # Get business account info
         url = f"{settings.IG_API_BASE}/{settings.IG_USER_ID}"
         params = {
             "fields": "id,username,name,followers_count,follows_count,biography,website,profile_picture_url",
@@ -396,48 +357,93 @@ async def get_user_demographics():
                 "following": account_data.get("follows_count", 0),
                 "biography": account_data.get("biography", ""),
                 "website": account_data.get("website", "")
-            },
-            "insights": {
-                "follower_growth_potential": "Analyze followers over time",
-                "engagement_rate": "Track from posts data",
-                "audience_quality": "High engagement posts suggest quality audience"
-            },
-            "note": "For detailed demographics, upgrade to Instagram Business Account and use Instagram Insights API"
+            }
         }
     except Exception as e:
         logger.error(f"❌ Demographics error: {e}")
-        return {
-            "account": {},
-            "insights": {},
-            "note": f"Error: {str(e)}"
-        }
+        return {"account": {}}
+
+# ==================== COMMENTS & DMs ====================
+
+@app.get("/comments")
+async def get_comments():
+    """Get both comments and DMs"""
+    try:
+        comments = await ig_api.get_comments()
+        dms = await ig_api.get_conversations()
+        
+        # Format comments
+        formatted_comments = [
+            {
+                "id": c.get("id"),
+                "username": c.get("from", {}).get("username", "Unknown"),
+                "text": c.get("text", ""),
+                "timestamp": c.get("timestamp", ""),
+                "status": "pending",
+                "type": "comment",
+                "reply": None
+            }
+            for c in comments
+        ]
+        
+        # Format DMs
+        formatted_dms = [
+            {
+                "id": dm.get("id"),
+                "username": dm.get("participants", [{}])[0].get("username", "Unknown"),
+                "text": dm.get("last_message", ""),
+                "timestamp": dm.get("updated_at", ""),
+                "status": "pending",
+                "type": "dm",
+                "reply": None
+            }
+            for dm in dms
+        ]
+        
+        all_messages = formatted_comments + formatted_dms
+        logger.info(f"💬 Retrieved {len(formatted_comments)} comments + {len(formatted_dms)} DMs")
+        
+        return all_messages
+    except Exception as e:
+        logger.error(f"❌ Comments error: {e}")
+        return []
+
+@app.get("/dms")
+async def get_dms():
+    """Get DMs only"""
+    try:
+        dms = await ig_api.get_conversations()
+        logger.info(f"📱 Retrieved {len(dms)} DM conversations")
+        return dms
+    except Exception as e:
+        logger.error(f"❌ DMs error: {e}")
+        return []
 
 # ==================== SCHEDULING ====================
 
-# In-memory storage (use Supabase for production)
 scheduled_posts = []
 
 @app.post("/posts/schedule")
-async def schedule_post(post: SchedulePostRequest):
-    """Schedule a post for later"""
+async def schedule_post(request: SchedulePostRequest):
     try:
         scheduled_post = {
             "id": len(scheduled_posts) + 1,
-            "caption": post.caption,
-            "hashtags": post.hashtags,
-            "scheduledTime": post.scheduledTime,
-            "useAI": post.useAI,
+            "caption": request.caption,
+            "hashtags": request.hashtags,
+            "scheduledTime": request.scheduledTime,
+            "useAI": request.useAI,
             "status": "scheduled",
+            "media": None,
             "createdAt": datetime.now().isoformat()
         }
         
         scheduled_posts.append(scheduled_post)
-        logger.info(f"📅 Post scheduled for {post.scheduledTime}")
+        logger.info(f"📅 Post scheduled for {request.scheduledTime}")
         
         return {
             "success": True,
             "post": scheduled_post,
-            "message": f"Post scheduled for {post.scheduledTime}"
+            "message": f"Post scheduled for {request.scheduledTime}"
         }
     except Exception as e:
         logger.error(f"❌ Schedule error: {e}")
@@ -445,7 +451,6 @@ async def schedule_post(post: SchedulePostRequest):
 
 @app.get("/posts/scheduled")
 async def get_scheduled_posts():
-    """Get all scheduled posts"""
     try:
         logger.info(f"📅 Retrieved {len(scheduled_posts)} scheduled posts")
         return {
@@ -456,67 +461,70 @@ async def get_scheduled_posts():
         logger.error(f"❌ Get scheduled error: {e}")
         return {"data": [], "total": 0}
 
-# ==================== COMMENTS ====================
+# ==================== MEDIA UPLOAD ====================
 
-@app.get("/comments")
-async def get_comments():
-    """Get recent comments from Instagram"""
+@app.post("/media/upload")
+async def upload_media(file: UploadFile = File(...)):
+    """Upload media for scheduled posts"""
     try:
-        comments = await ig_api.get_comments()
+        # Save file temporarily
+        upload_dir = "/tmp/instaflow_uploads"
+        os.makedirs(upload_dir, exist_ok=True)
         
-        formatted_comments = [
-            {
-                "id": c.get("id"),
-                "username": c.get("from", {}).get("username", "Unknown"),
-                "text": c.get("text", ""),
-                "timestamp": c.get("timestamp", ""),
-                "status": "pending",
-                "reply": None
-            }
-            for c in comments
-        ]
+        file_path = f"{upload_dir}/{file.filename}"
+        with open(file_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
         
-        logger.info(f"💬 Retrieved {len(formatted_comments)} comments")
-        return formatted_comments
+        logger.info(f"📸 Media uploaded: {file.filename}")
+        
+        return {
+            "success": True,
+            "filename": file.filename,
+            "size": len(content),
+            "path": file_path
+        }
     except Exception as e:
-        logger.error(f"❌ Comments error: {e}")
-        return []
+        logger.error(f"❌ Media upload error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
 # ==================== AI ENDPOINTS ====================
 
 def get_claude_client():
-    """Create Claude client"""
     return Anthropic(api_key=settings.ANTHROPIC_API_KEY)
 
 @app.post("/ai/caption")
 async def generate_caption(request: CaptionRequest):
-    """Generate Instagram caption with Claude"""
     try:
         if not settings.ANTHROPIC_API_KEY:
             raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
         
         client = get_claude_client()
         
+        system_prompt = f"""You are an Instagram caption expert. 
+Your writing style: {request.writing_style or 'engaging and professional'}
+Topic focus: {request.topic or 'general'}
+
+Write captions that are:
+- Engaging and authentic
+- 100-150 characters
+- Include a clear call-to-action
+- Use relevant emojis"""
+        
         message = client.messages.create(
             model=settings.CLAUDE_MODEL,
             max_tokens=300,
+            system=system_prompt,
             messages=[
                 {
                     "role": "user",
-                    "content": f"""Write an engaging Instagram caption for this post:
-"{request.prompt}"
-
-Requirements:
-- Keep it under 150 characters
-- Use conversational tone
-- Add relevant emojis
-- Make it shareable"""
+                    "content": f"Write an Instagram caption for: {request.prompt}"
                 }
             ]
         )
         
         caption = message.content[0].text
-        logger.info(f"✨ Generated caption (Claude)")
+        logger.info(f"✨ Generated caption")
         
         return {
             "caption": caption,
@@ -529,7 +537,6 @@ Requirements:
 
 @app.post("/ai/hashtags")
 async def generate_hashtags(request: HashtagsRequest):
-    """Generate Instagram hashtags with Claude"""
     try:
         if not settings.ANTHROPIC_API_KEY:
             raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
@@ -542,9 +549,7 @@ async def generate_hashtags(request: HashtagsRequest):
             messages=[
                 {
                     "role": "user",
-                    "content": f"""Generate 15 relevant Instagram hashtags for this topic:
-"{request.topic}"
-
+                    "content": f"""Generate 15 relevant Instagram hashtags for: {request.topic}
 Return ONLY hashtags as a comma-separated list, no explanations.
 Example: productivity, lifestyle, entrepreneur, businessowner"""
                 }
@@ -569,21 +574,13 @@ Example: productivity, lifestyle, entrepreneur, businessowner"""
 
 @app.websocket("/ws/analytics")
 async def websocket_analytics(websocket: WebSocket):
-    """Real-time analytics updates via WebSocket
-    Sends analytics every 5 seconds
-    """
     await websocket.accept()
     logger.info("🔌 WebSocket connected")
     
     try:
         while True:
-            # Get current analytics
             analytics = await get_analytics()
-            
-            # Send to client
             await websocket.send_json(analytics)
-            
-            # Wait 5 seconds before next update
             await asyncio.sleep(5)
     except Exception as e:
         logger.error(f"❌ WebSocket error: {e}")
@@ -594,7 +591,6 @@ async def websocket_analytics(websocket: WebSocket):
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
-    """Global exception handler"""
     logger.error(f"❌ Unhandled error: {exc}", exc_info=True)
     return {
         "status": "error",
@@ -602,18 +598,13 @@ async def global_exception_handler(request, exc):
         "type": type(exc).__name__
     }
 
-# ==================== RUN ====================
-
 if __name__ == "__main__":
     import uvicorn
-    import os
-    
     port = int(os.getenv("PORT", 8000))
-    
     uvicorn.run(
         "backend.main:app",
         host="0.0.0.0",
         port=port,
         log_level="info",
         reload=settings.DEBUG
-    )
+        )
