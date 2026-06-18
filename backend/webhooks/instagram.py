@@ -71,6 +71,12 @@ async def handle_instagram_webhook(request: Request):
         conversation_obj = body.get("conversation", {})
         account_obj = body.get("account", {})
         
+        # SIMPLE DEBUG: Always log what we got
+        logger.info(f"🔍 WEBHOOK DEBUG:")
+        logger.info(f"   event_type: {event_type}")
+        logger.info(f"   message_obj keys: {list(message_obj.keys())}")
+        logger.info(f"   message_obj: {message_obj}")
+        
         # ==================== EVENT FILTERING ====================
         # Handle BOTH comments AND DMs (FIXED)
         if event_type not in ["comment.received", "message.received"]:
@@ -109,7 +115,7 @@ async def handle_instagram_webhook(request: Request):
             logger.info(f"   Account: @{account_obj.get('username', 'unknown')}")
             logger.info("="*70)
         else:
-            # For comments: Extract from message object (similar structure)
+            # For comments: Extract from message object
             message_id = message_obj.get("id")
             message_text = message_obj.get("text", "")
             sender_obj = message_obj.get("sender", {})
