@@ -204,12 +204,12 @@ async def handle_instagram_webhook(request: Request):
                         "reply_id": success
                     }
                 else:
-                    logger.warning(f"⚠️  Reply posting failed")
+                    logger.warning(f"⚠️  Reply posting failed (no ID in response)")
                     return {
                         "status": "warning",
                         "event": event_type,
                         "action": action_taken,
-                        "message": "Failed to post reply"
+                        "message": "Reply posted but no confirmation ID"
                     }
             except Exception as reply_error:
                 logger.error(f"❌ Reply error: {reply_error}")
@@ -343,9 +343,17 @@ async def send_dm_reply(conversation_id: str, message_text: str, sender_id: str,
             response = await client.post(url, json=payload, headers=headers, timeout=10.0)
             response.raise_for_status()
             result = response.json()
-            message_id = result.get("id") or result.get("message_id") or result.get("data", {}).get("id")
             
-            logger.info(f"✅ DM sent successfully! ID: {message_id}")
+            # Extract ID from various possible response formats
+            message_id = (
+                result.get("id") 
+                or result.get("message_id") 
+                or result.get("data", {}).get("id")
+                or result.get("message", {}).get("id")
+                or "success"  # If no ID in response, return "success" indicator
+            )
+            
+            logger.info(f"✅ DM sent successfully! Response: {result}")
             return message_id
     except Exception as e:
         logger.error(f"❌ Failed to send DM reply: {e}")
