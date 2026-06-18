@@ -114,26 +114,38 @@ async def handle_instagram_webhook(request: Request):
             logger.info(f"   Text: {message_text[:50]}...")
             logger.info(f"   Account: @{account_obj.get('username', 'unknown')}")
             logger.info("="*70)
-        else:
-            # For comments: Extract from message object
-            message_id = message_obj.get("id")
-            message_text = message_obj.get("text", "")
-            sender_obj = message_obj.get("sender", {})
-            sender_id = sender_obj.get("id")
-            sender_username = sender_obj.get("username", "Unknown")
-            timestamp = message_obj.get("sentAt", "")
-            account_id = account_obj.get("id")
-            conversation_id = message_obj.get("conversationId")  # Post ID for comments
-            
-            logger.info("")
-            logger.info("="*70)
-            logger.info("💬 Comment Received")
-            logger.info("="*70)
-            logger.info(f"   ID: {message_id}")
-            logger.info(f"   From: @{sender_username}")
-            logger.info(f"   Text: {message_text[:50]}...")
-            logger.info(f"   Account: @{account_obj.get('username', 'unknown')}")
-            logger.info("="*70)
+       else:
+           comment_obj = body.get("comment", {})
+           post_obj = body.get("post", {})
+
+           message_id = comment_obj.get("id")
+           message_text = comment_obj.get("text", "")
+
+           author_obj = comment_obj.get("author", {})
+
+           sender_id = author_obj.get("id")
+           sender_username = author_obj.get("username", "Unknown")
+
+           timestamp = comment_obj.get("createdTime", "")
+           account_id = account_obj.get("id")
+   
+           conversation_id = (
+            post_obj.get("id")
+           or comment_obj.get("postId")
+           or None
+           )
+
+           logger.info("")
+          logger.info("=" * 70)
+          logger.info("💬 Comment Received")
+          logger.info("=" * 70)
+          logger.info(f"   ID: {message_id}")
+          logger.info(f"   From: @{sender_username}")
+          logger.info(f"   Text: {message_text[:50]}...")
+          logger.info("=" * 70)
+    
+        
+           
         
         # ==================== SKIP OWN COMMENTS ====================
         # Prevent infinite loop if we reply to our own comment/DM
