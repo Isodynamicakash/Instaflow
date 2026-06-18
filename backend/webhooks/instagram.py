@@ -93,6 +93,12 @@ async def handle_instagram_webhook(request: Request):
             conversation_id = message_obj.get("conversationId")
             account_id = account_obj.get("id")
             
+            # DEBUG: Log extracted values
+            logger.info(f"🔍 DEBUG - Extracted fields:")
+            logger.info(f"   account_id: {account_id}")
+            logger.info(f"   account_obj: {account_obj}")
+            logger.info(f"   conversation_id: {conversation_id}")
+            
             logger.info("")
             logger.info("="*70)
             logger.info("💬 DM Received")
@@ -175,11 +181,12 @@ async def handle_instagram_webhook(request: Request):
             
             try:
                 if is_dm:
-                    # Send DM reply via Zernio
+                    # Send DM reply via Zernio (with account_id)
                     success = await send_dm_reply(
                         conversation_id=conversation_id,
                         message_text=response_text,
-                        sender_id=sender_id
+                        sender_id=sender_id,
+                        account_id=account_id
                     )
                 else:
                     # Post comment reply via Instagram API
@@ -224,11 +231,12 @@ async def handle_instagram_webhook(request: Request):
             
             try:
                 if is_dm:
-                    # Send holding reply via Zernio
+                    # Send holding reply via Zernio (with account_id)
                     success = await send_dm_reply(
                         conversation_id=conversation_id,
                         message_text=response_text,
-                        sender_id=sender_id
+                        sender_id=sender_id,
+                        account_id=account_id
                     )
                 else:
                     # Post holding reply via Instagram API
@@ -301,51 +309,43 @@ async def post_comment_reply(comment_id: str, reply_text: str) -> str:
         logger.error(f"❌ Failed to post comment reply: {e}")
         return None
 
-async def send_dm_reply(conversation_id: str, message_text: str, sender_id: str) -> str:
+async def send_dm_reply(conversation_id: str, message_text: str, sender_id: str, account_id: str = None) -> str:
     """Send a DM reply via Zernio"""
     try:
+        logger.info(f"📤 send_dm_reply called with:")
+        logger.info(f"   account_id param: {account_id}")
+        logger.info(f"   conversation_id: {conversation_id}")
+        
         url = f"{settings.ZERNIO_API_BASE}/v1/inbox/conversations/{conversation_id}/messages"
         headers = {
             "Authorization": f"Bearer {settings.ZERNIO_API_KEY}",
             "Content-Type": "application/json"
         }
         
-        # Try Zernio API format 1: {"text": "...", "recipient_id": "..."}
+        # Zernio API requires accountId
+        if not account_id:
+            logger.warning(f"⚠️ account_id is None, using fallback from settings")
+            account_id = settings.ZERNIO_ACCOUNT_ID
+            logger.info(f"   Fallback account_id: {account_id}")
+        
+        # Correct Zernio payload format: {"text": "...", "accountId": "..."}
         payload = {
             "text": message_text,
-            "recipient_id": sender_id
+            "accountId": account_id
         }
         
         logger.info(f"📤 Sending DM via Zernio")
         logger.info(f"   URL: {url}")
+        logger.info(f"   Final accountId in payload: {payload.get('accountId')}")
         logger.info(f"   Payload: {payload}")
         
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=payload, headers=headers, timeout=10.0)
-            
-            # If 400, try alternative payload formats
-            if response.status_code == 400:
-                logger.warning(f"⚠️ Format 1 failed (text field), trying format 2 (body field)...")
-                
-                # Try format 2: {"body": "...", "recipient_id": "..."}
-                payload_alt = {
-                    "body": message_text,
-                    "recipient_id": sender_id
-                }
-                response = await client.post(url, json=payload_alt, headers=headers, timeout=10.0)
-                
-                if response.status_code == 400:
-                    logger.warning(f"⚠️ Format 2 failed, trying format 3 (no recipient_id)...")
-                    
-                    # Try format 3: Just text/body without recipient
-                    payload_alt2 = {"text": message_text}
-                    response = await client.post(url, json=payload_alt2, headers=headers, timeout=10.0)
-            
             response.raise_for_status()
             result = response.json()
             message_id = result.get("id") or result.get("message_id") or result.get("data", {}).get("id")
             
-            logger.info(f"✅ DM sent: {result}")
+            logger.info(f"✅ DM sent successfully! ID: {message_id}")
             return message_id
     except Exception as e:
         logger.error(f"❌ Failed to send DM reply: {e}")
