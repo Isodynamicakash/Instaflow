@@ -309,19 +309,46 @@ async def send_dm_reply(conversation_id: str, message_text: str, sender_id: str)
             "Authorization": f"Bearer {settings.ZERNIO_API_KEY}",
             "Content-Type": "application/json"
         }
+        
+        # Try Zernio API format 1: {"text": "...", "recipient_id": "..."}
         payload = {
-            "message": message_text,
+            "text": message_text,
             "recipient_id": sender_id
         }
         
+        logger.info(f"📤 Sending DM via Zernio")
+        logger.info(f"   URL: {url}")
+        logger.info(f"   Payload: {payload}")
+        
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=payload, headers=headers, timeout=10.0)
+            
+            # If 400, try alternative payload formats
+            if response.status_code == 400:
+                logger.warning(f"⚠️ Format 1 failed (text field), trying format 2 (body field)...")
+                
+                # Try format 2: {"body": "...", "recipient_id": "..."}
+                payload_alt = {
+                    "body": message_text,
+                    "recipient_id": sender_id
+                }
+                response = await client.post(url, json=payload_alt, headers=headers, timeout=10.0)
+                
+                if response.status_code == 400:
+                    logger.warning(f"⚠️ Format 2 failed, trying format 3 (no recipient_id)...")
+                    
+                    # Try format 3: Just text/body without recipient
+                    payload_alt2 = {"text": message_text}
+                    response = await client.post(url, json=payload_alt2, headers=headers, timeout=10.0)
+            
             response.raise_for_status()
             result = response.json()
-            message_id = result.get("id") or result.get("message_id")
+            message_id = result.get("id") or result.get("message_id") or result.get("data", {}).get("id")
             
             logger.info(f"✅ DM sent: {result}")
             return message_id
     except Exception as e:
         logger.error(f"❌ Failed to send DM reply: {e}")
+        logger.error(f"   Status: {response.status_code if 'response' in locals() else 'N/A'}")
+        logger.error(f"   Response: {response.text if 'response' in locals() else 'N/A'}")
         return None
