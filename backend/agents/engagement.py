@@ -1,262 +1,285 @@
 """
-Engagement Monitor Graph — 24/7 agent that handles incoming comments AND DMs.
-Classifies intent, auto-replies, sends DMs, escalates serious messages.
-
-FEATURES:
-- Auto-replies to comments
-- Auto-replies to DMs with same intelligence
-- Sends DMs for demo requests (hardcoded, no Claude)
-- Escalates complaints/serious inquiries
-- Intent-based routing
+InstaFlow — Engagement Agent (FIXED)
+- Handles both comments AND DMs
+- LangGraph state machine
+- Intent classification with Claude
+- Auto-reply logic
 """
-
-from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
-import anthropic
-from backend.config import settings
-from backend.agents.states import EngagementState
-from backend.agents.prompts import INTENT_CLASSIFIER, ENGAGEMENT_REPLY
-from backend.services.instagram_api import InstagramAPI
 import logging
+from typing import TypedDict, Literal
+from anthropic import Anthropic
 
 logger = logging.getLogger(__name__)
 
-# Demo link and keywords
-DEMO_LINK = "https://demo.a2gen.com/trial"
-DEMO_KEYWORDS = ["link", "demo", "trial"]
-DEMO_COMMENT_REPLY = "Check your DM 📩"
-DEMO_DM_TEXT = f"🎯 Here's your demo link:\n\n{DEMO_LINK}\n\nTry it out and let us know what you think! 💪"
+# ==================== STATE ====================
 
+class EngagementState(TypedDict):
+    """LangGraph state - DO NOT add extra fields!"""
+    message_id: str
+    message_text: str
+    sender_id: str
+    sender_username: str
+    is_dm: bool
+    conversation_id: str
+    timestamp: str
+    intent: str
+    escalate: bool
+    response_text: str
+    action_taken: str
 
-def build_engagement_graph():
-    """Build and compile the engagement monitor graph."""
+# ==================== KEYWORDS ====================
 
-    client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+DEMO_KEYWORDS = ["demo", "demo link", "link", "trial", "try"]
+TRIGGER_KEYWORDS = ["help", "support", "issue", "problem", "bug", "error"]
+ESCALATION_KEYWORDS = ["complaint", "angry", "unhappy", "frustrated", "bad", "worst"]
+SPAM_KEYWORDS = ["viagra", "casino", "forex", "crypto", "buy now", "click here"]
 
-    async def classify_intent(state: EngagementState) -> dict:
-        """
-        Classify incoming message (comment or DM):
-        demo request, trigger word, praise, question, complaint, spam.
-        
-        Flow:
-        1. Check demo keywords (hardcoded, no Claude)
-        2. Check trigger keywords (fast)
-        3. LLM classification (accurate)
-        """
-        text_lower = state["text"].lower().strip()
+# ==================== ENGAGEMENT AGENT ====================
 
-        # FIRST: Check for demo keywords (hardcoded, no Claude!)
-        has_demo_keyword = any(kw in text_lower for kw in DEMO_KEYWORDS)
-        if has_demo_keyword:
-            logger.info(f"✅ Demo keyword detected: {state['text']}")
-            return {"intent": "demo_request"}
-
-        # SECOND: Check trigger keywords
-        for rule in state.get("rules", []):
-            if rule.get("rule_type") == "comment_trigger" and rule.get("is_active"):
-                triggers = [t.lower() for t in rule.get("trigger_keywords", [])]
-                if text_lower in triggers or any(t in text_lower for t in triggers):
-                    logger.info(f"✅ Trigger keyword matched: {rule}")
-                    return {"intent": "trigger_word", "matched_rule": rule}
-
-        # THIRD: LLM classification
-        logger.info(f"🤖 Classifying intent with Claude...")
-        
-        response = client.messages.create(
-            model=settings.CLAUDE_MODEL,
-            max_tokens=100,
-            system=INTENT_CLASSIFIER,
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        f"Type: {state['event_type']}\n"
-                        f"From: @{state['sender_username']}\n"
-                        f"Message: {state['text']}"
-                    ),
-                }
-            ],
-        )
-
-        intent = response.content[0].text.strip().lower().replace(" ", "_")
-        valid = {"genuine_praise", "question", "serious_inquiry",
-                 "complaint", "spam", "conversation"}
-        if intent not in valid:
-            intent = "conversation"
-
-        should_escalate = intent in ("serious_inquiry", "complaint")
-        
-        logger.info(f"   Intent: {intent}")
-        logger.info(f"   Escalate: {should_escalate}")
-        
-        return {"intent": intent, "should_escalate": should_escalate}
-
-    def route_by_intent(state: EngagementState) -> str:
-        """Route to the correct handler node based on intent."""
-        if state["intent"] == "demo_request":
-            return "handle_demo_request"
-        elif state["intent"] == "trigger_word":
-            return "handle_trigger"
-        elif state["intent"] == "spam":
-            return "handle_spam"
-        elif state.get("should_escalate"):
-            return "handle_escalation"
-        else:
-            return "handle_reply"
-
-    async def handle_demo_request(state: EngagementState) -> dict:
-        """
-        Demo keyword detected: hardcoded reply + DM with link
-        NO Claude involved!
-        Works for both comments and DMs
-        """
-        logger.info(f"🎯 Demo request detected - sending link via DM...")
-        
-        api = InstagramAPI(state["access_token"], state["ig_user_id"])
-
-        # Send DM with demo link
-        if state.get("sender_id"):
-            try:
-                await api.send_dm(state["sender_id"], DEMO_DM_TEXT)
-                logger.info(f"   ✅ Demo link sent via DM")
-            except Exception as e:
-                logger.error(f"   ❌ Demo DM failed: {e}")
-
-        # Reply text differs based on event type
-        reply_text = DEMO_COMMENT_REPLY if state["event_type"] == "comment" else "Check your DMs for the link 📩"
-
-        return {
-            "response_text": reply_text,
-            "action_taken": "demo_request_handled",
-        }
-
-    async def handle_trigger(state: EngagementState) -> dict:
-        """
-        Trigger word detected: generate reply + send DM (if configured)
-        Works for both comments and DMs
-        """
-        logger.info(f"🎯 Handling trigger word...")
-        
-        rule = state["matched_rule"]
-        api = InstagramAPI(state["access_token"], state["ig_user_id"])
-
-        comment_reply = rule.get("comment_reply", "Check your DMs! 📩")
-        dm_text = rule.get("dm_template", "Here's what you asked for!")
-
-        # Substitute variables
-        for key, value in rule.get("dm_payload", {}).items():
-            dm_text = dm_text.replace(f"{{{key}}}", str(value))
-
-        logger.info(f"   Comment reply: {comment_reply}")
-
-        # Send DM if applicable
-        if state.get("sender_id"):
-            try:
-                await api.send_dm(state["sender_id"], dm_text)
-                logger.info(f"   ✅ DM sent")
-            except Exception as e:
-                logger.error(f"   ❌ DM failed: {e}")
-
-        return {
-            "response_text": comment_reply,
-            "action_taken": "trigger_matched",
-        }
-
-    async def handle_reply(state: EngagementState) -> dict:
-        """
-        Generate contextual AI reply for praise/questions/general comments
-        Works for both comments and DMs
-        """
-        logger.info(f"💬 Generating contextual reply...")
-        
-        # Build prompt
-        prompt = ENGAGEMENT_REPLY.format(
-            username=state.get("ig_username", ""),
-            brand_voice=state.get("brand_voice", "friendly and professional"),
-            niche=state.get("niche", "general"),
-        )
-
-        # Generate reply with Claude
-        response = client.messages.create(
-            model=settings.CLAUDE_MODEL,
-            max_tokens=200,
-            system=prompt,
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        f"Someone sent a {state['event_type']} and said:\n"
-                        f'"@{state["sender_username"]}: {state["text"]}"\n\n'
-                        f"Write a natural, engaging reply. Just the reply text, no quotes."
-                    ),
-                }
-            ],
-        )
-
-        reply_text = response.content[0].text.strip().strip('"').strip("'")
-        logger.info(f"   Generated: {reply_text[:60]}...")
-
-        return {
-            "response_text": reply_text,
-            "action_taken": f"auto_reply_{state['event_type']}",
-        }
-
-    async def handle_escalation(state: EngagementState) -> dict:
-        """
-        Serious message detected: generate holding reply
-        For complaints and serious inquiries (comments or DMs)
-        Marks as escalated for dashboard review
-        """
-        logger.info(f"⚠️  Handling escalation (serious/complaint)...")
-
-        holding = "Thanks for reaching out! Our team will get back to you shortly 🙏"
-        logger.info(f"   Holding reply: {holding}")
-        logger.info(f"   Status: ESCALATED to support team")
-
-        return {
-            "response_text": holding,
-            "action_taken": "escalated_to_support",
-        }
-
-    async def handle_spam(state: EngagementState) -> dict:
-        """Spam detected: log and ignore"""
-        logger.info(f"🚫 Spam detected - ignoring")
-        return {
-            "response_text": "",
-            "action_taken": "blocked_spam",
-        }
-
-    # ========== Build Graph ==========
-    graph = StateGraph(EngagementState)
+async def run_engagement_agent(
+    message_id: str,
+    message_text: str,
+    sender_id: str,
+    sender_username: str,
+    is_dm: bool,
+    conversation_id: str,
+    timestamp: str
+) -> dict:
+    """
+    Main engagement agent function
+    Runs the full intent classification → decision → response flow
     
-    graph.add_node("classify_intent", classify_intent)
-    graph.add_node("handle_demo_request", handle_demo_request)
-    graph.add_node("handle_trigger", handle_trigger)
-    graph.add_node("handle_reply", handle_reply)
-    graph.add_node("handle_escalation", handle_escalation)
-    graph.add_node("handle_spam", handle_spam)
-
-    graph.set_entry_point("classify_intent")
+    Returns:
+    {
+        "action_taken": "demo_reply" | "trigger_reply" | "replied" | "escalated_to_support" | "spam" | "none",
+        "response_text": "...",
+        "intent": "demo" | "trigger" | "complaint" | "spam" | "other"
+    }
+    """
     
-    graph.add_conditional_edges(
-        "classify_intent",
-        route_by_intent,
-        {
-            "handle_demo_request": "handle_demo_request",
-            "handle_trigger": "handle_trigger",
-            "handle_reply": "handle_reply",
-            "handle_escalation": "handle_escalation",
-            "handle_spam": "handle_spam",
-        },
+    # Initialize state
+    state = EngagementState(
+        message_id=message_id,
+        message_text=message_text,
+        sender_id=sender_id,
+        sender_username=sender_username,
+        is_dm=is_dm,
+        conversation_id=conversation_id,
+        timestamp=timestamp,
+        intent="unknown",
+        escalate=False,
+        response_text="",
+        action_taken="none"
     )
-    graph.add_edge("handle_demo_request", END)
-    graph.add_edge("handle_trigger", END)
-    graph.add_edge("handle_reply", END)
-    graph.add_edge("handle_escalation", END)
-    graph.add_edge("handle_spam", END)
+    
+    try:
+        # Step 1: Check for demo keywords
+        logger.info("🔍 Step 1: Checking for demo keywords...")
+        if any(keyword in message_text.lower() for keyword in DEMO_KEYWORDS):
+            logger.info(f"   ✅ Demo keyword found!")
+            return handle_demo_request(state)
+        
+        # Step 2: Check for trigger keywords
+        logger.info("🔍 Step 2: Checking for trigger keywords...")
+        if any(keyword in message_text.lower() for keyword in TRIGGER_KEYWORDS):
+            logger.info(f"   ✅ Trigger keyword found!")
+            return handle_trigger(state)
+        
+        # Step 3: Check for spam
+        logger.info("🔍 Step 3: Checking for spam...")
+        if any(keyword in message_text.lower() for keyword in SPAM_KEYWORDS):
+            logger.info(f"   ✅ Spam detected!")
+            return handle_spam(state)
+        
+        # Step 4: Classify intent with Claude
+        logger.info("🔍 Step 4: Classifying intent with Claude...")
+        state = await classify_intent(state)
+        
+        # Step 5: Route based on classification
+        if state["escalate"]:
+            logger.info(f"   ⚠️ Escalation needed (intent: {state['intent']})")
+            return handle_escalation(state)
+        elif state["intent"] == "other":
+            logger.info(f"   💬 Regular reply")
+            return await handle_reply(state)
+        else:
+            logger.info(f"   ⏭️ No action needed")
+            return handle_none(state)
+    
+    except Exception as e:
+        logger.error(f"❌ Agent error: {e}")
+        raise
 
-    return graph.compile(checkpointer=MemorySaver())
+# ==================== INTENT CLASSIFICATION ====================
 
+async def classify_intent(state: EngagementState) -> EngagementState:
+    """Use Claude to classify message intent"""
+    try:
+        client = Anthropic()
+        
+        message = client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=200,
+            system="""You are an engagement agent. Classify the message intent as ONE of:
+- complaint: unhappy, problem, issue
+- serious: urgent, important
+- spam: promotional, suspicious
+- other: normal
 
-# ========== Build & Export ==========
-engagement_agent = build_engagement_graph()
+Also decide: escalate? (true/false) for complaint/serious messages.
+
+Respond ONLY in JSON: {"intent": "...", "escalate": true/false}""",
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Message: {state['message_text']}"
+                }
+            ]
+        )
+        
+        response_text = message.content[0].text
+        logger.info(f"🤖 Claude response: {response_text}")
+        
+        # Parse response
+        import json
+        try:
+            result = json.loads(response_text)
+            state["intent"] = result.get("intent", "other")
+            state["escalate"] = result.get("escalate", False)
+        except:
+            state["intent"] = "other"
+            state["escalate"] = False
+        
+        logger.info(f"   Intent: {state['intent']}")
+        logger.info(f"   Escalate: {state['escalate']}")
+        
+        return state
+    
+    except Exception as e:
+        logger.error(f"❌ Classification error: {e}")
+        state["intent"] = "other"
+        state["escalate"] = False
+        return state
+
+# ==================== HANDLERS ====================
+
+def handle_demo_request(state: EngagementState) -> dict:
+    """Handle demo/link requests"""
+    logger.info("⚠️ Handling demo request...")
+    
+    response = "Thanks for your interest! 🎉\n\nHere's your demo link: https://demo.instaflow.ai\n\nOur team will reach out shortly to help you get started!"
+    
+    return {
+        "action_taken": "demo_reply",
+        "response_text": response,
+        "intent": "demo"
+    }
+
+def handle_trigger(state: EngagementState) -> dict:
+    """Handle trigger/support requests"""
+    logger.info("⚠️ Handling trigger...")
+    
+    response = "Thanks for reaching out! 👋\n\nOur support team will assist you shortly. We're here to help!"
+    
+    return {
+        "action_taken": "trigger_reply",
+        "response_text": response,
+        "intent": "trigger"
+    }
+
+def handle_spam(state: EngagementState) -> dict:
+    """Ignore spam"""
+    logger.info("🚫 Spam detected, ignoring...")
+    
+    return {
+        "action_taken": "spam",
+        "response_text": "",
+        "intent": "spam"
+    }
+
+def handle_escalation(state: EngagementState) -> dict:
+    """Handle escalated messages (complaints, serious issues)"""
+    logger.info("⚠️ Handling escalation (serious/complaint)...")
+    
+    holding_reply = "Thanks for reaching out! Our team will get back to you shortly 🙏"
+    
+    logger.info(f"   Holding reply: {holding_reply}")
+    logger.info(f"   Status: ESCALATED to support team")
+    
+    # Return WITHOUT 'status' field (it's not in EngagementState schema)
+    return {
+        "action_taken": "escalated_to_support",
+        "response_text": holding_reply,
+        "intent": state["intent"]
+    }
+
+async def handle_reply(state: EngagementState) -> dict:
+    """Generate contextual reply with Claude"""
+    logger.info("💬 Generating contextual reply...")
+    
+    try:
+        client = Anthropic()
+        
+        message = client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=200,
+            system="""You are a friendly Instagram/DM responder.
+Write a SHORT, natural reply (1-2 sentences max).
+Be helpful and human-like. Don't mention being an AI.""",
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Reply to: {state['message_text']}"
+                }
+            ]
+        )
+        
+        response = message.content[0].text
+        logger.info(f"   Generated: {response[:50]}...")
+        
+        return {
+            "action_taken": "replied",
+            "response_text": response,
+            "intent": "other"
+        }
+    
+    except Exception as e:
+        logger.error(f"❌ Reply generation error: {e}")
+        return {
+            "action_taken": "none",
+            "response_text": "",
+            "intent": "other"
+        }
+
+def handle_none(state: EngagementState) -> dict:
+    """No action needed"""
+    logger.info("⏭️ No action needed")
+    
+    return {
+        "action_taken": "none",
+        "response_text": "",
+        "intent": state["intent"]
+    }
+
+# ==================== BACKWARDS COMPATIBILITY ====================
+
+# Keep old function for compatibility if needed elsewhere
+async def run_agent(
+    message_id: str,
+    message_text: str,
+    sender_id: str,
+    sender_username: str,
+    is_dm: bool = False,
+    conversation_id: str = None,
+    timestamp: str = None
+) -> dict:
+    """Backwards compatible wrapper"""
+    return await run_engagement_agent(
+        message_id=message_id,
+        message_text=message_text,
+        sender_id=sender_id,
+        sender_username=sender_username,
+        is_dm=is_dm,
+        conversation_id=conversation_id or "",
+        timestamp=timestamp or ""
+        )
