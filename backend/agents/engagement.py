@@ -216,7 +216,6 @@ def build_engagement_graph():
         return {
             "response_text": holding,
             "action_taken": "escalated_to_support",
-            "status": "escalated",  # Mark as escalated in dashboard
         }
 
     async def handle_spam(state: EngagementState) -> dict:
