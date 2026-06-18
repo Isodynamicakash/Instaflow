@@ -1,6 +1,9 @@
 """
-InstaFlow — Complete Main Server with DM Support
+InstaFlow — Complete Main Server with DM Support (FIXED)
 Webhooks + Dashboard API + DMs + Schedule Posts
+- Fixed DM data formatting
+- Proper timestamp parsing
+- Correct username extraction
 """
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, HTTPException, UploadFile, File
@@ -87,7 +90,7 @@ class InstagramAPI:
             return []
 
     async def get_conversations(self):
-        """Get DM conversations"""
+        """Get DM conversations from Zernio"""
         try:
             url = f"{settings.ZERNIO_API_BASE}/v1/inbox/conversations"
             headers = {"Authorization": f"Bearer {settings.ZERNIO_API_KEY}"}
@@ -386,19 +389,58 @@ async def get_comments():
             for c in comments
         ]
         
-        # Format DMs
-        formatted_dms = [
-            {
-                "id": dm.get("id"),
-                "username": dm.get("participants", [{}])[0].get("username", "Unknown"),
-                "text": dm.get("last_message", ""),
-                "timestamp": dm.get("updated_at", ""),
-                "status": "pending",
-                "type": "dm",
-                "reply": None
-            }
-            for dm in dms
-        ]
+        # Format DMs (FIXED VERSION)
+        formatted_dms = []
+        for dm in dms:
+            try:
+                # Get participant username (first participant who is NOT the account owner)
+                participants = dm.get("participants", [])
+                username = "Unknown"
+                
+                if participants and len(participants) > 0:
+                    for p in participants:
+                        p_id = p.get("id", "")
+                        if p_id and p_id != settings.IG_USER_ID:
+                            username = p.get("username", "Unknown")
+                            break
+                    # If not found, use first participant
+                    if username == "Unknown" and participants:
+                        username = participants[0].get("username", "Unknown")
+                
+                # Get message text
+                text = dm.get("last_message", "")
+                if not text:
+                    text = dm.get("message", "")
+                
+                # Parse timestamp properly
+                timestamp = dm.get("updated_at", "")
+                if not timestamp:
+                    timestamp = dm.get("created_at", "")
+                
+                if timestamp:
+                    try:
+                        # Handle different timestamp formats
+                        if timestamp.endswith("Z"):
+                            dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                        else:
+                            dt = datetime.fromisoformat(timestamp)
+                        timestamp = dt.isoformat()
+                    except Exception as ts_error:
+                        logger.warning(f"⚠️ Could not parse timestamp: {timestamp} - {ts_error}")
+                        timestamp = ""
+                
+                formatted_dms.append({
+                    "id": dm.get("id", ""),
+                    "username": username,
+                    "text": text,
+                    "timestamp": timestamp,
+                    "status": "pending",
+                    "type": "dm",
+                    "reply": None
+                })
+            except Exception as dm_error:
+                logger.error(f"⚠️ Error formatting DM: {dm_error}")
+                continue
         
         all_messages = formatted_comments + formatted_dms
         logger.info(f"💬 Retrieved {len(formatted_comments)} comments + {len(formatted_dms)} DMs")
@@ -607,4 +649,4 @@ if __name__ == "__main__":
         port=port,
         log_level="info",
         reload=settings.DEBUG
-        )
+                        )
