@@ -1,6 +1,6 @@
 """
-InstaFlow — Complete Main Server
-Webhooks + Dashboard API + Real Analytics
+InstaFlow — Complete Main Server with Advanced Analytics
+Webhooks + Dashboard API + Real Analytics + Hashtags + Best Times + Demographics
 Run: uvicorn backend.main:app --reload --port 8000
 Deploy: Railway
 """
@@ -13,6 +13,7 @@ import asyncio
 import httpx
 from anthropic import Anthropic
 from datetime import datetime
+from collections import defaultdict
 
 from backend.config import settings
 from backend.webhooks.instagram import router as ig_webhook_router
@@ -112,7 +113,11 @@ async def lifespan(app: FastAPI):
     logger.info(f"   Endpoints:")
     logger.info(f"      POST /webhook/instagram (Webhooks)")
     logger.info(f"      GET  /analytics (Dashboard)")
+    logger.info(f"      GET  /analytics/hashtags (Top hashtags)")
+    logger.info(f"      GET  /analytics/best-time (Best hours & days)")
+    logger.info(f"      GET  /analytics/demographics (Audience)")
     logger.info(f"      POST /posts/schedule")
+    logger.info(f"      GET  /posts/scheduled")
     logger.info(f"      GET  /comments")
     logger.info(f"      POST /ai/caption")
     logger.info(f"      POST /ai/hashtags")
@@ -129,7 +134,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="InstaFlow Agent",
-    description="Real-time Instagram AI engagement agent + Dashboard",
+    description="Real-time Instagram AI engagement agent + Advanced Dashboard",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -166,6 +171,9 @@ async def root():
             "webhook": "/webhook/instagram",
             "dashboard": {
                 "analytics": "/analytics",
+                "hashtags": "/analytics/hashtags",
+                "best_time": "/analytics/best-time",
+                "demographics": "/analytics/demographics",
                 "schedule": "/posts/schedule",
                 "scheduled": "/posts/scheduled",
                 "comments": "/comments",
@@ -228,6 +236,180 @@ async def get_analytics():
             "totalLikes": 0,
             "totalComments": 0,
             "recentEngagement": []
+        }
+
+# ==================== TOP PERFORMING HASHTAGS ====================
+
+@app.get("/analytics/hashtags")
+async def get_top_hashtags():
+    """Get top performing hashtags from your captions"""
+    try:
+        posts = await ig_api.get_posts()
+        hashtag_performance = {}
+        
+        for post in posts:
+            caption = post.get("caption", "")
+            hashtags = [tag.strip() for tag in caption.split() if tag.startswith("#")]
+            
+            for hashtag in hashtags:
+                if hashtag not in hashtag_performance:
+                    hashtag_performance[hashtag] = {
+                        "count": 0,
+                        "total_likes": 0,
+                        "total_comments": 0,
+                        "avg_engagement": 0
+                    }
+                
+                hashtag_performance[hashtag]["count"] += 1
+                hashtag_performance[hashtag]["total_likes"] += post.get("like_count", 0)
+                hashtag_performance[hashtag]["total_comments"] += post.get("comments_count", 0)
+        
+        # Calculate averages and sort
+        for tag in hashtag_performance:
+            count = hashtag_performance[tag]["count"]
+            hashtag_performance[tag]["avg_engagement"] = (
+                (hashtag_performance[tag]["total_likes"] + hashtag_performance[tag]["total_comments"]) / count
+            ) if count > 0 else 0
+        
+        # Sort by engagement
+        top_hashtags = sorted(
+            hashtag_performance.items(),
+            key=lambda x: x[1]["avg_engagement"],
+            reverse=True
+        )[:10]
+        
+        logger.info(f"🏆 Found {len(hashtag_performance)} unique hashtags")
+        
+        return {
+            "hashtags": [
+                {
+                    "tag": tag,
+                    "count": data["count"],
+                    "total_likes": data["total_likes"],
+                    "total_comments": data["total_comments"],
+                    "avg_engagement": round(data["avg_engagement"], 1)
+                }
+                for tag, data in top_hashtags
+            ],
+            "total_unique": len(hashtag_performance)
+        }
+    except Exception as e:
+        logger.error(f"❌ Hashtags error: {e}")
+        return {"hashtags": [], "total_unique": 0}
+
+# ==================== BEST TIME TO PUBLISH ====================
+
+@app.get("/analytics/best-time")
+async def get_best_publishing_time():
+    """Get best times to publish based on engagement"""
+    try:
+        posts = await ig_api.get_posts()
+        
+        time_performance = defaultdict(lambda: {"count": 0, "total_engagement": 0})
+        day_performance = defaultdict(lambda: {"count": 0, "total_engagement": 0})
+        
+        for post in posts:
+            timestamp = post.get("timestamp", "")
+            if not timestamp:
+                continue
+            
+            # Parse timestamp: 2026-06-17T14:49:19+0000
+            try:
+                post_time = datetime.fromisoformat(timestamp.replace("+0000", "+00:00"))
+                hour = post_time.hour
+                day = post_time.strftime("%A")
+                
+                engagement = post.get("like_count", 0) + post.get("comments_count", 0)
+                
+                time_performance[hour]["count"] += 1
+                time_performance[hour]["total_engagement"] += engagement
+                
+                day_performance[day]["count"] += 1
+                day_performance[day]["total_engagement"] += engagement
+            except:
+                continue
+        
+        # Calculate averages
+        best_hours = []
+        for hour in sorted(time_performance.keys()):
+            data = time_performance[hour]
+            avg_engagement = data["total_engagement"] / data["count"] if data["count"] > 0 else 0
+            best_hours.append({
+                "hour": f"{hour:02d}:00",
+                "engagement": round(avg_engagement, 1),
+                "posts": data["count"]
+            })
+        
+        best_days = []
+        days_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        for day in days_order:
+            if day in day_performance:
+                data = day_performance[day]
+                avg_engagement = data["total_engagement"] / data["count"] if data["count"] > 0 else 0
+                best_days.append({
+                    "day": day,
+                    "engagement": round(avg_engagement, 1),
+                    "posts": data["count"]
+                })
+        
+        # Get top 3
+        top_hours = sorted(best_hours, key=lambda x: x["engagement"], reverse=True)[:3]
+        top_days = sorted(best_days, key=lambda x: x["engagement"], reverse=True)[:3]
+        
+        logger.info(f"⏰ Best publishing times analyzed")
+        
+        return {
+            "best_hours": top_hours,
+            "best_days": top_days,
+            "all_hours": best_hours,
+            "all_days": best_days
+        }
+    except Exception as e:
+        logger.error(f"❌ Best time error: {e}")
+        return {"best_hours": [], "best_days": [], "all_hours": [], "all_days": []}
+
+# ==================== AUDIENCE DEMOGRAPHICS ====================
+
+@app.get("/analytics/demographics")
+async def get_user_demographics():
+    """Get follower demographics (requires business account)"""
+    try:
+        # Get business account info
+        url = f"{settings.IG_API_BASE}/{settings.IG_USER_ID}"
+        params = {
+            "fields": "id,username,name,followers_count,follows_count,biography,website,profile_picture_url",
+            "access_token": settings.IG_ACCESS_TOKEN,
+        }
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, params=params, timeout=10.0)
+            response.raise_for_status()
+            account_data = response.json()
+        
+        logger.info(f"📱 Retrieved account demographics")
+        
+        return {
+            "account": {
+                "username": account_data.get("username"),
+                "name": account_data.get("name"),
+                "followers": account_data.get("followers_count", 0),
+                "following": account_data.get("follows_count", 0),
+                "biography": account_data.get("biography", ""),
+                "website": account_data.get("website", "")
+            },
+            "insights": {
+                "follower_growth_potential": "Analyze followers over time",
+                "engagement_rate": "Track from posts data",
+                "audience_quality": "High engagement posts suggest quality audience"
+            },
+            "note": "For detailed demographics, upgrade to Instagram Business Account and use Instagram Insights API"
+        }
+    except Exception as e:
+        logger.error(f"❌ Demographics error: {e}")
+        return {
+            "account": {},
+            "insights": {},
+            "note": f"Error: {str(e)}"
         }
 
 # ==================== SCHEDULING ====================
@@ -434,4 +616,4 @@ if __name__ == "__main__":
         port=port,
         log_level="info",
         reload=settings.DEBUG
-        )
+    )
