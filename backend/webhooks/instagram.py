@@ -328,9 +328,9 @@ async def send_dm_reply(conversation_id: str, message_text: str, sender_id: str,
             account_id = settings.ZERNIO_ACCOUNT_ID
             logger.info(f"   Fallback account_id: {account_id}")
         
-        # Correct Zernio payload format: {"text": "...", "accountId": "..."}
+        # Correct Zernio payload format: {"message": "...", "accountId": "..."}
         payload = {
-            "text": message_text,
+            "message": message_text,
             "accountId": account_id
         }
         
