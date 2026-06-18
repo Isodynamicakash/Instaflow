@@ -1,11 +1,13 @@
 """
-Engagement Monitor Graph — 24/7 agent that handles incoming comments.
+Engagement Monitor Graph — 24/7 agent that handles incoming comments AND DMs.
 Classifies intent, auto-replies, sends DMs, escalates serious messages.
 
 FEATURES:
 - Auto-replies to comments
+- Auto-replies to DMs with same intelligence
 - Sends DMs for demo requests (hardcoded, no Claude)
-- Escalates complaints
+- Escalates complaints/serious inquiries
+- Intent-based routing
 """
 
 from langgraph.graph import StateGraph, END
@@ -21,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 # Demo link and keywords
 DEMO_LINK = "https://demo.a2gen.com/trial"
-DEMO_KEYWORDS = ["link", "demo"]
+DEMO_KEYWORDS = ["link", "demo", "trial"]
 DEMO_COMMENT_REPLY = "Check your DM 📩"
 DEMO_DM_TEXT = f"🎯 Here's your demo link:\n\n{DEMO_LINK}\n\nTry it out and let us know what you think! 💪"
 
@@ -33,7 +35,8 @@ def build_engagement_graph():
 
     async def classify_intent(state: EngagementState) -> dict:
         """
-        Classify incoming comment: demo request, trigger word, praise, question, complaint, spam.
+        Classify incoming message (comment or DM):
+        demo request, trigger word, praise, question, complaint, spam.
         
         Flow:
         1. Check demo keywords (hardcoded, no Claude)
@@ -105,6 +108,7 @@ def build_engagement_graph():
         """
         Demo keyword detected: hardcoded reply + DM with link
         NO Claude involved!
+        Works for both comments and DMs
         """
         logger.info(f"🎯 Demo request detected - sending link via DM...")
         
@@ -118,14 +122,18 @@ def build_engagement_graph():
             except Exception as e:
                 logger.error(f"   ❌ Demo DM failed: {e}")
 
+        # Reply text differs based on event type
+        reply_text = DEMO_COMMENT_REPLY if state["event_type"] == "comment" else "Check your DMs for the link 📩"
+
         return {
-            "response_text": DEMO_COMMENT_REPLY,
+            "response_text": reply_text,
             "action_taken": "demo_request_handled",
         }
 
     async def handle_trigger(state: EngagementState) -> dict:
         """
-        Trigger word detected: generate reply + send DM
+        Trigger word detected: generate reply + send DM (if configured)
+        Works for both comments and DMs
         """
         logger.info(f"🎯 Handling trigger word...")
         
@@ -141,7 +149,7 @@ def build_engagement_graph():
 
         logger.info(f"   Comment reply: {comment_reply}")
 
-        # Send DM
+        # Send DM if applicable
         if state.get("sender_id"):
             try:
                 await api.send_dm(state["sender_id"], dm_text)
@@ -157,6 +165,7 @@ def build_engagement_graph():
     async def handle_reply(state: EngagementState) -> dict:
         """
         Generate contextual AI reply for praise/questions/general comments
+        Works for both comments and DMs
         """
         logger.info(f"💬 Generating contextual reply...")
         
@@ -176,7 +185,7 @@ def build_engagement_graph():
                 {
                     "role": "user",
                     "content": (
-                        f"Someone said:\n"
+                        f"Someone sent a {state['event_type']} and said:\n"
                         f'"@{state["sender_username"]}: {state["text"]}"\n\n'
                         f"Write a natural, engaging reply. Just the reply text, no quotes."
                     ),
@@ -195,15 +204,19 @@ def build_engagement_graph():
     async def handle_escalation(state: EngagementState) -> dict:
         """
         Serious message detected: generate holding reply
+        For complaints and serious inquiries (comments or DMs)
+        Marks as escalated for dashboard review
         """
         logger.info(f"⚠️  Handling escalation (serious/complaint)...")
 
         holding = "Thanks for reaching out! Our team will get back to you shortly 🙏"
         logger.info(f"   Holding reply: {holding}")
+        logger.info(f"   Status: ESCALATED to support team")
 
         return {
             "response_text": holding,
             "action_taken": "escalated_to_support",
+            "status": "escalated",  # Mark as escalated in dashboard
         }
 
     async def handle_spam(state: EngagementState) -> dict:
