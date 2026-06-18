@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     ZERNIO_API_KEY: str = os.getenv("ZERNIO_API_KEY", "").strip()
     ZERNIO_ACCOUNT_ID: str = os.getenv("ZERNIO_ACCOUNT_ID", "").strip()
     ZERNIO_WEBHOOK_SECRET: str = os.getenv("ZERNIO_WEBHOOK_SECRET", "").strip()
+    ZERNIO_API_BASE: str = os.getenv("ZERNIO_API_BASE", "https://api.zernio.com")
 
     # Anthropic
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "").strip()
