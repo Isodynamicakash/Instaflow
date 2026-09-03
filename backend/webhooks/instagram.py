@@ -8,7 +8,10 @@ are owned by Zernio comment-automations, configured from the dashboard's
 Flows tab. This webhook's job now is just:
   1. Log every event so it shows up in the dashboard Inbox.
   2. Skip your own messages (loop prevention).
-  3. If AGENT_ENABLED is flipped back to True, fall through to the old
+  3. Send a manual "please follow" nudge to CONFIRMED non-followers who
+     match a follower-gated flow's keyword — Zernio's own automation
+     silently skips this exact case (see NON-FOLLOWER NUDGE section below).
+  4. If AGENT_ENABLED is flipped back to True, fall through to the old
      Claude-based agent for anything not already handled by a flow.
 """
 from fastapi import APIRouter, Request, HTTPException
@@ -16,6 +19,8 @@ from pydantic import BaseModel
 import logging
 import httpx
 import asyncio
+import re
+import time
 from datetime import datetime
 
 from backend.config import settings
@@ -63,6 +68,108 @@ async def verify_webhook(request: Request):
     except Exception as e:
         logger.error(f"❌ Verification error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# ==================== NON-FOLLOWER NUDGE HELPERS ====================
+# Zernio's own comment-automation, when audience.followerStatus == "follower",
+# only shows the follow-gate/verify step to people whose status is UNRESOLVED
+# (first-time senders). Once Meta has confirmed someone's status as False
+# (they've messaged before, so consent exists, and the real answer is "not
+# following"), Zernio silently SKIPS them — no message at all, not even
+# notFollowingMessage. That's correct per Zernio's own docs, but if you want
+# a nudge sent to known non-followers every time they trigger a keyword, that
+# has to happen here, since Zernio's automation won't do it.
+
+_automations_cache = {"data": None, "fetched_at": 0}
+_AUTOMATIONS_CACHE_TTL = 30  # seconds — avoid hammering Zernio on bursty traffic
+
+async def get_active_automations() -> list:
+    """Fetches the account's comment-automations from Zernio directly
+    (raw shape, not the dashboard-reshaped version in api/automations.py),
+    cached briefly to avoid a Zernio call on every single webhook event."""
+    now = time.monotonic()
+    if _automations_cache["data"] is not None and (now - _automations_cache["fetched_at"]) < _AUTOMATIONS_CACHE_TTL:
+        return _automations_cache["data"]
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{settings.ZERNIO_API_BASE}/v1/comment-automations",
+                headers={"Authorization": f"Bearer {settings.ZERNIO_API_KEY}"},
+                params={"profileId": settings.ZERNIO_PROFILE_ID, "accountId": settings.ZERNIO_ACCOUNT_ID},
+                timeout=10.0,
+            )
+            r.raise_for_status()
+            data = r.json()
+            automations = data.get("automations") or data.get("data") or []
+            _automations_cache["data"] = automations
+            _automations_cache["fetched_at"] = now
+            return automations
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch automations for nudge check: {e}")
+        return _automations_cache["data"] or []
+
+def matches_automation_keywords(text: str, automation: dict) -> bool:
+    """Mirrors Zernio's matchMode semantics (contains/word/exact).
+    NOTE: does not replicate typoTolerance — a known, minor gap versus
+    Zernio's own matcher, acceptable since this only controls an extra
+    manual nudge, not the primary automated reply."""
+    text_lower = (text or "").lower()
+    words = re.findall(r"\w+", text_lower)
+    match_mode = automation.get("matchMode", "word")
+    for kw in automation.get("keywords", []):
+        kw = (kw or "").strip().lower()
+        if not kw:
+            continue
+        if match_mode == "exact":
+            if text_lower.strip() == kw:
+                return True
+        elif match_mode == "word":
+            if kw in words:
+                return True
+        else:  # contains
+            if kw in text_lower:
+                return True
+    return False
+
+async def maybe_send_non_follower_nudge(message_text: str, sender_obj: dict, conversation_id: str, sender_id: str, account_id: str):
+    """If the sender is a CONFIRMED non-follower (isFollower is exactly
+    False, not None/unresolved) and their message matches a keyword on an
+    active, follower-gated flow that has a notFollowingMessage configured,
+    send that message manually. Returns True if a nudge was sent."""
+    profile = sender_obj.get("instagramProfile") or {}
+    if profile.get("isFollower") is not False:
+        return False  # True (is a follower), or None (unresolved — Zernio's own gate handles this case)
+
+    try:
+        automations = await get_active_automations()
+    except Exception as e:
+        logger.error(f"❌ Could not load automations for nudge check: {e}")
+        return False
+
+    for auto in automations:
+        if not auto.get("isActive"):
+            continue
+        if not auto.get("alsoMatchInDms"):
+            continue  # this nudge only covers the DM path currently
+        audience = auto.get("audience") or {}
+        if audience.get("followerStatus") != "follower":
+            continue
+        gate = auto.get("followGate") or {}
+        nudge_text = gate.get("notFollowingMessage")
+        if not nudge_text:
+            continue
+        if matches_automation_keywords(message_text, auto):
+            logger.info(
+                f"🔔 Confirmed non-follower matched flow '{auto.get('name')}' "
+                f"(Zernio would skip silently) — sending manual nudge"
+            )
+            await send_dm_reply(
+                conversation_id=conversation_id,
+                message_text=nudge_text,
+                sender_id=sender_id,
+                account_id=account_id,
+            )
+            return True
+    return False
 
 # ==================== WEBHOOK HANDLER ====================
 
@@ -146,6 +253,25 @@ async def handle_instagram_webhook(request: Request):
         if sender_id == account_id or sender_username == account_obj.get("username"):
             logger.info(f"⏭️  OWN {'MESSAGE' if is_dm else 'COMMENT'} - SKIPPING (prevents infinite loop)")
             return {"status": "ok", "skipped": True, "reason": "own_message"}
+
+        # ==================== NON-FOLLOWER NUDGE (DMs only, fills a native gap) ====================
+        # See the helper functions above for the full explanation: Zernio's own
+        # audience gate silently skips CONFIRMED non-followers (isFollower ==
+        # False) rather than sending notFollowingMessage, which only fires
+        # during the unresolved/verify path. This catches that gap manually.
+        if is_dm:
+            try:
+                nudged = await maybe_send_non_follower_nudge(
+                    message_text=message_text,
+                    sender_obj=sender_obj,
+                    conversation_id=conversation_id,
+                    sender_id=sender_id,
+                    account_id=account_id,
+                )
+                if nudged:
+                    return {"status": "ok", "event": event_type, "action": "non_follower_nudge_sent"}
+            except Exception as e:
+                logger.error(f"❌ Non-follower nudge check failed (continuing normally): {e}")
 
         # ==================== FLOWS OWN ALL TRIGGER REPLIES ====================
         # Zernio's comment-automations (configured in the dashboard's Flows tab)
