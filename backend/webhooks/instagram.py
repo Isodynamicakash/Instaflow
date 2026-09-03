@@ -201,24 +201,38 @@ async def send_follow_check_prompt(conversation_id: str, sender_id: str, account
         }],
     )
 
-async def maybe_send_non_follower_nudge(message_text: str, sender_obj: dict, conversation_id: str, sender_id: str, account_id: str):
-    """Catches what Zernio's own audience gate would otherwise miss or
-    silently skip. Runs a LIVE follow-status check at trigger time — not
-    just trusting isFollower on the incoming payload, which can be stale
-    right after someone actually follows — so 'I just followed and sent
-    the keyword again' is handled correctly instead of falling through.
+# ==================== OUR OWN DELIVERY DEDUP ====================
+# Zernio's native audience gate has shown itself unreliable for this
+# use case — see the module-level note above the function below for the
+# evidence. Since we now deliver real content ourselves instead of relying
+# on Zernio's native gate, we need our own dedup so a repeat trigger from
+# an already-confirmed follower doesn't get the real content sent twice
+# BY US. This does not, and cannot, prevent Zernio's own native automation
+# from also independently sending — that's outside our visibility. In-memory
+# only, same limitation as the other caches in this file.
+_delivered_to = set()
 
-    - Payload already says isFollower == True -> let Zernio's native flow
-      handle it, don't interfere.
-    - Otherwise (False or unresolved None on the payload): re-check live.
-      If the live check now says True -> send the real content ourselves.
-      If still not confirmed -> send the Gate message with the check button.
+def already_delivered(sender_id: str, automation_id: str) -> bool:
+    return (sender_id, automation_id) in _delivered_to
+
+def mark_delivered(sender_id: str, automation_id: str):
+    _delivered_to.add((sender_id, automation_id))
+
+async def maybe_send_non_follower_nudge(message_text: str, sender_obj: dict, conversation_id: str, sender_id: str, account_id: str):
+    """Handles follower-gated flows END TO END ourselves, rather than
+    relying on Zernio's native audience-gate delivery.
+
+    WHY: real evidence from testing showed Zernio's own webhook payload
+    reporting isFollower: True on an event, while Zernio's own native
+    automation independently evaluated the SAME event as a non-follower
+    and silently skipped delivery (audienceSkipped incremented, dmsSent
+    did not) — a genuine inconsistency between two parts of Zernio's own
+    system, not something fixable by changing how we read their payload.
+    So: for every message matching a follower-gated flow's keyword, we now
+    always do our own LIVE check and, if confirmed, send the real content
+    OURSELVES — never assuming Zernio's native flow already handled it.
 
     Returns True if this function sent anything."""
-    profile = sender_obj.get("instagramProfile") or {}
-    if profile.get("isFollower") is True:
-        return False  # already confirmed on the payload — native flow handles it
-
     try:
         automations = await get_active_automations()
     except Exception as e:
@@ -244,6 +258,12 @@ async def maybe_send_non_follower_nudge(message_text: str, sender_obj: dict, con
     if not matched_auto:
         return False
 
+    automation_id = matched_auto.get("id") or matched_auto.get("_id")
+
+    if already_delivered(sender_id, automation_id):
+        logger.info(f"⏭️  Already delivered real content for '{matched_auto.get('name')}' to this person (our own dedup) — skipping")
+        return True
+
     live_status = await check_live_follow_status(account_id, sender_id)
     logger.info(f"🔍 Live follow-status check at trigger time for flow '{matched_auto.get('name')}': {live_status}")
 
@@ -256,7 +276,8 @@ async def maybe_send_non_follower_nudge(message_text: str, sender_obj: dict, con
                 sender_id=sender_id,
                 account_id=account_id,
             )
-            logger.info(f"✅ Live check confirmed follower — sent real content for '{matched_auto.get('name')}'")
+            mark_delivered(sender_id, automation_id)
+            logger.info(f"✅ Live check confirmed follower — sent real content ourselves for '{matched_auto.get('name')}'")
         return True
 
     logger.info(f"🔔 Not confirmed as following '{matched_auto.get('name')}' — sending Gate message with check button")
@@ -288,6 +309,7 @@ async def handle_follow_check_postback(payload: str, conversation_id: str, sende
                 sender_id=sender_id,
                 account_id=account_id,
             )
+            mark_delivered(sender_id, automation_id)
             logger.info("✅ Now following — sent real content")
     else:
         # Still not following (False) or Meta still can't resolve it (None) — loop the prompt
