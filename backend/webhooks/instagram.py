@@ -104,22 +104,6 @@ def is_duplicate_event(event_id: str) -> bool:
     _seen_event_ids[event_id] = now
     return False
 
-# ==================== PER-FLOW GATE STATE ====================
-# Tracks, per (sender, automation) pair, whether this person has already
-# been shown THIS flow's full "Gate message". First trigger of a given
-# keyword/flow -> full gate message. Repeat triggers of the SAME flow ->
-# "If still not following" instead. A DIFFERENT flow's keyword is a fresh
-# pair, so it gets its own first-time gate message even for someone who's
-# already seen a different flow's gate. In-memory only — same limitation
-# as the automations cache: lost on restart, not shared across replicas.
-_gate_shown_to = set()
-
-def has_seen_gate(sender_id: str, automation_id: str) -> bool:
-    return (sender_id, automation_id) in _gate_shown_to
-
-def mark_gate_shown(sender_id: str, automation_id: str):
-    _gate_shown_to.add((sender_id, automation_id))
-
 async def get_active_automations() -> list:
     """Fetches the account's comment-automations from Zernio directly
     (raw shape, not the dashboard-reshaped version in api/automations.py),
@@ -197,11 +181,13 @@ async def find_automation_by_id(automation_id: str):
 FOLLOW_CHECK_PAYLOAD_PREFIX = "instaflow_followcheck:"
 
 async def send_follow_check_prompt(conversation_id: str, sender_id: str, account_id: str, automation: dict, text: str = None):
-    """Sends the nudge text with a postback button. Tapping it re-checks
-    live follow status (see the postback handler in the webhook route) and
-    either sends the real content or loops back to this same prompt."""
+    """Sends the Gate message with a postback button. Tapping it re-checks
+    live follow status (see the postback handler below) and either sends
+    the real content or loops back to this same prompt. Always uses the
+    flow's Gate message — no alternate/fallback text; the button's only
+    job is the recheck."""
     gate = automation.get("followGate") or {}
-    body = text or gate.get("notFollowingMessage") or "Looks like you're not following yet — follow, then tap below to try again."
+    body = text or gate.get("message") or gate.get("notFollowingMessage") or "Follow to unlock this, then tap below to check again."
     button_label = (gate.get("buttonLabel") or "I'm following ✅")[:20]  # Zernio caps button titles at 20 chars
     await send_dm_reply(
         conversation_id=conversation_id,
@@ -216,15 +202,22 @@ async def send_follow_check_prompt(conversation_id: str, sender_id: str, account
     )
 
 async def maybe_send_non_follower_nudge(message_text: str, sender_obj: dict, conversation_id: str, sender_id: str, account_id: str):
-    """If the sender is a CONFIRMED non-follower (isFollower is exactly
-    False, not None/unresolved) and their message matches a keyword on an
-    active, follower-gated flow, send the appropriate prompt WITH a
-    check-again button. First trigger of THIS flow -> the full gate message;
-    repeat triggers of the same flow -> the shorter notFollowingMessage.
-    Returns True if sent."""
+    """Catches what Zernio's own audience gate would otherwise miss or
+    silently skip. Runs a LIVE follow-status check at trigger time — not
+    just trusting isFollower on the incoming payload, which can be stale
+    right after someone actually follows — so 'I just followed and sent
+    the keyword again' is handled correctly instead of falling through.
+
+    - Payload already says isFollower == True -> let Zernio's native flow
+      handle it, don't interfere.
+    - Otherwise (False or unresolved None on the payload): re-check live.
+      If the live check now says True -> send the real content ourselves.
+      If still not confirmed -> send the Gate message with the check button.
+
+    Returns True if this function sent anything."""
     profile = sender_obj.get("instagramProfile") or {}
-    if profile.get("isFollower") is not False:
-        return False  # True (is a follower), or None (unresolved — Zernio's own gate handles this case)
+    if profile.get("isFollower") is True:
+        return False  # already confirmed on the payload — native flow handles it
 
     try:
         automations = await get_active_automations()
@@ -232,31 +225,43 @@ async def maybe_send_non_follower_nudge(message_text: str, sender_obj: dict, con
         logger.error(f"❌ Could not load automations for nudge check: {e}")
         return False
 
+    matched_auto = None
     for auto in automations:
         if not auto.get("isActive"):
             continue
         if not auto.get("alsoMatchInDms"):
-            continue  # this nudge only covers the DM path currently
+            continue  # this path only covers DMs currently
         audience = auto.get("audience") or {}
         if audience.get("followerStatus") != "follower":
             continue
         gate = auto.get("followGate") or {}
-        gate_message = gate.get("message")
-        not_following_message = gate.get("notFollowingMessage")
-        if not gate_message and not not_following_message:
-            continue  # nothing configured to send for this flow — skip it
+        if not gate.get("message") and not gate.get("notFollowingMessage"):
+            continue  # nothing configured to send for this flow
         if matches_automation_keywords(message_text, auto):
-            automation_id = auto.get("id") or auto.get("_id")
-            first_time_for_this_flow = not has_seen_gate(sender_id, automation_id)
-            text_to_send = (gate_message if first_time_for_this_flow and gate_message else None) or not_following_message
-            logger.info(
-                f"🔔 Confirmed non-follower matched flow '{auto.get('name')}' "
-                f"({'first time on this flow — full gate message' if first_time_for_this_flow else 'repeat on this flow — short nudge'})"
+            matched_auto = auto
+            break
+
+    if not matched_auto:
+        return False
+
+    live_status = await check_live_follow_status(account_id, sender_id)
+    logger.info(f"🔍 Live follow-status check at trigger time for flow '{matched_auto.get('name')}': {live_status}")
+
+    if live_status is True:
+        real_message = matched_auto.get("dmMessage", "")
+        if real_message:
+            await send_dm_reply(
+                conversation_id=conversation_id,
+                message_text=real_message,
+                sender_id=sender_id,
+                account_id=account_id,
             )
-            mark_gate_shown(sender_id, automation_id)
-            await send_follow_check_prompt(conversation_id, sender_id, account_id, auto, text=text_to_send)
-            return True
-    return False
+            logger.info(f"✅ Live check confirmed follower — sent real content for '{matched_auto.get('name')}'")
+        return True
+
+    logger.info(f"🔔 Not confirmed as following '{matched_auto.get('name')}' — sending Gate message with check button")
+    await send_follow_check_prompt(conversation_id, sender_id, account_id, matched_auto)
+    return True
 
 async def handle_follow_check_postback(payload: str, conversation_id: str, sender_id: str, account_id: str) -> bool:
     """Handles a tap on the check-again button: re-checks live follow
