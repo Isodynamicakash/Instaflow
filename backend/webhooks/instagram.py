@@ -1,7 +1,15 @@
 """
-InstaFlow — Instagram Webhook Handler (FIXED)
-Handles comment.received AND message.received events
-Routes to engagement agent for auto-replies
+InstaFlow — Instagram Webhook Handler (AGENT DISABLED)
+Handles comment.received AND message.received events.
+
+The conversational agent (Claude-based classify/reply) is now OFF by default.
+All keyword-triggered replies — comment/DM auto-reply, the follow-gate loop —
+are owned by Zernio comment-automations, configured from the dashboard's
+Flows tab. This webhook's job now is just:
+  1. Log every event so it shows up in the dashboard Inbox.
+  2. Skip your own messages (loop prevention).
+  3. If AGENT_ENABLED is flipped back to True, fall through to the old
+     Claude-based agent for anything not already handled by a flow.
 """
 from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
@@ -14,6 +22,10 @@ from backend.config import settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# Flip to True to restore the old Claude-based auto-reply agent as a fallback
+# for anything a Flow doesn't catch. Leave False while flows own everything.
+AGENT_ENABLED = False
 
 # ==================== MODELS ====================
 
@@ -38,10 +50,10 @@ async def verify_webhook(request: Request):
     try:
         verify_token = request.query_params.get("hub.verify_token")
         challenge = request.query_params.get("hub.challenge")
-        
+
         logger.info(f"🔐 Webhook verification attempt")
         logger.info(f"   Token: {verify_token}")
-        
+
         if verify_token == settings.ZERNIO_WEBHOOK_SECRET or verify_token == "instaflow_test_token":
             logger.info(f"✅ Webhook verified!")
             return int(challenge)
@@ -64,30 +76,30 @@ async def handle_instagram_webhook(request: Request):
     try:
         body = await request.json()
         logger.info(f"📨 Webhook received")
-        
+
         # Parse payload - Zernio sends message/conversation directly, not in "data"
         event_type = body.get("event", "unknown")
         message_obj = body.get("message", {})
         conversation_obj = body.get("conversation", {})
         account_obj = body.get("account", {})
-        
+
         # SIMPLE DEBUG: Always log what we got
         logger.info(f"🔍 WEBHOOK DEBUG:")
         logger.info(f"   event_type: {event_type}")
         logger.info(f"   message_obj keys: {list(message_obj.keys())}")
         logger.info(f"   message_obj: {message_obj}")
-        
+
         # ==================== EVENT FILTERING ====================
-        # Handle BOTH comments AND DMs (FIXED)
+        # Handle BOTH comments AND DMs
         if event_type not in ["comment.received", "message.received"]:
             logger.info(f"⏭️  Ignoring event: {event_type}")
             return {"status": "ok", "event": event_type}
-        
+
         # Determine if it's a comment or DM
         is_dm = event_type == "message.received"
-        
+
         # ==================== EXTRACT DATA FROM ZERNIO PAYLOAD ====================
-        
+
         if is_dm:
             # For DMs: Extract from message object
             message_id = message_obj.get("id")
@@ -98,13 +110,7 @@ async def handle_instagram_webhook(request: Request):
             timestamp = message_obj.get("sentAt", "")
             conversation_id = message_obj.get("conversationId")
             account_id = account_obj.get("id")
-            
-            # DEBUG: Log extracted values
-            logger.info(f"🔍 DEBUG - Extracted fields:")
-            logger.info(f"   account_id: {account_id}")
-            logger.info(f"   account_obj: {account_obj}")
-            logger.info(f"   conversation_id: {conversation_id}")
-            
+
             logger.info("")
             logger.info("="*70)
             logger.info("💬 DM Received")
@@ -124,7 +130,7 @@ async def handle_instagram_webhook(request: Request):
             timestamp = message_obj.get("sentAt", "")
             account_id = account_obj.get("id")
             conversation_id = message_obj.get("conversationId")  # Post ID for comments
-            
+
             logger.info("")
             logger.info("="*70)
             logger.info("💬 Comment Received")
@@ -134,20 +140,30 @@ async def handle_instagram_webhook(request: Request):
             logger.info(f"   Text: {message_text[:50]}...")
             logger.info(f"   Account: @{account_obj.get('username', 'unknown')}")
             logger.info("="*70)
-        
+
         # ==================== SKIP OWN COMMENTS ====================
         # Prevent infinite loop if we reply to our own comment/DM
         if sender_id == account_id or sender_username == account_obj.get("username"):
             logger.info(f"⏭️  OWN {'MESSAGE' if is_dm else 'COMMENT'} - SKIPPING (prevents infinite loop)")
             return {"status": "ok", "skipped": True, "reason": "own_message"}
-        
-        # ==================== CALL ENGAGEMENT AGENT ====================
+
+        # ==================== FLOWS OWN ALL TRIGGER REPLIES ====================
+        # Zernio's comment-automations (configured in the dashboard's Flows tab)
+        # already matched, follow-gated, and replied to this event on Zernio's
+        # side before this webhook even fired — this handler is a parallel
+        # notification stream, not the thing sending the reply. We just log it
+        # so it shows up in the dashboard Inbox, and stop here.
+        if not AGENT_ENABLED:
+            logger.info("📥 Event logged for inbox — no auto-reply (agent disabled, flows own all triggers)")
+            return {"status": "ok", "event": event_type, "action": "logged_only"}
+
+        # ==================== CALL ENGAGEMENT AGENT (fallback path, off by default) ====================
         logger.info(f"🤖 Calling engagement agent...")
-        
+
         try:
             # Import here to avoid circular imports
             from backend.agents.engagement import run_engagement_agent
-            
+
             # Run async agent
             agent_result = await run_engagement_agent(
                 message_id=message_id,
@@ -158,14 +174,14 @@ async def handle_instagram_webhook(request: Request):
                 conversation_id=conversation_id,
                 timestamp=timestamp
             )
-            
+
             action_taken = agent_result.get("action_taken", "none")
             response_text = agent_result.get("response_text", "")
-            
+
             logger.info(f"✅ Agent processed")
             logger.info(f"   Action: {action_taken}")
             logger.info(f"   Reply: {response_text[:50]}...")
-            
+
         except Exception as agent_error:
             logger.error(f"❌ Agent error: {agent_error}")
             return {
@@ -173,9 +189,9 @@ async def handle_instagram_webhook(request: Request):
                 "message": str(agent_error),
                 "event": event_type
             }
-        
+
         # ==================== POST REPLY ====================
-        
+
         # If action is to reply, post it back
         if action_taken in ["demo_reply", "trigger_reply", "replied"]:
             logger.info("="*70)
@@ -184,7 +200,7 @@ async def handle_instagram_webhook(request: Request):
             logger.info(f"   {'Comment' if not is_dm else 'Message'} ID: {message_id}")
             logger.info(f"   Reply: {response_text[:50]}...")
             logger.info("="*70)
-            
+
             try:
                 if is_dm:
                     # Send DM reply via Zernio (with account_id)
@@ -200,7 +216,7 @@ async def handle_instagram_webhook(request: Request):
                         comment_id=message_id,
                         reply_text=response_text
                     )
-                
+
                 if success:
                     logger.info(f"✅ Reply posted successfully! ID: {success}")
                     return {
@@ -225,7 +241,7 @@ async def handle_instagram_webhook(request: Request):
                     "action": action_taken,
                     "error": str(reply_error)
                 }
-        
+
         elif action_taken == "escalated_to_support":
             logger.info("="*70)
             logger.info("⚠️  Message Escalated to Support")
@@ -234,7 +250,7 @@ async def handle_instagram_webhook(request: Request):
             logger.info(f"   From: @{sender_username}")
             logger.info(f"   Holding Reply: {response_text[:50]}...")
             logger.info("="*70)
-            
+
             try:
                 if is_dm:
                     # Send holding reply via Zernio (with account_id)
@@ -250,7 +266,7 @@ async def handle_instagram_webhook(request: Request):
                         comment_id=message_id,
                         reply_text=response_text
                     )
-                
+
                 if success:
                     logger.info(f"✅ Holding reply posted! ID: {success}")
                     # TODO: Send to support queue/Slack
@@ -275,7 +291,7 @@ async def handle_instagram_webhook(request: Request):
                     "action": action_taken,
                     "error": str(escalation_error)
                 }
-        
+
         else:
             # No reply needed (spam, ignored, etc.)
             logger.info(f"⏭️  No reply needed (action: {action_taken})")
@@ -284,7 +300,7 @@ async def handle_instagram_webhook(request: Request):
                 "event": event_type,
                 "action": action_taken
             }
-    
+
     except Exception as e:
         logger.error(f"❌ Webhook error: {e}", exc_info=True)
         return {
@@ -292,7 +308,7 @@ async def handle_instagram_webhook(request: Request):
             "message": str(e)
         }
 
-# ==================== REPLY POSTING ====================
+# ==================== REPLY POSTING (fallback-path helpers, kept for AGENT_ENABLED=True) ====================
 
 async def post_comment_reply(comment_id: str, reply_text: str) -> str:
     """Post a reply to an Instagram comment"""
@@ -302,13 +318,13 @@ async def post_comment_reply(comment_id: str, reply_text: str) -> str:
             "message": reply_text,
             "access_token": settings.IG_ACCESS_TOKEN
         }
-        
+
         async with httpx.AsyncClient() as client:
             response = await client.post(url, data=payload, timeout=10.0)
             response.raise_for_status()
             result = response.json()
             reply_id = result.get("id")
-            
+
             logger.info(f"✅ Reply posted: {result}")
             return reply_id
     except Exception as e:
@@ -321,44 +337,44 @@ async def send_dm_reply(conversation_id: str, message_text: str, sender_id: str,
         logger.info(f"📤 send_dm_reply called with:")
         logger.info(f"   account_id param: {account_id}")
         logger.info(f"   conversation_id: {conversation_id}")
-        
+
         url = f"{settings.ZERNIO_API_BASE}/v1/inbox/conversations/{conversation_id}/messages"
         headers = {
             "Authorization": f"Bearer {settings.ZERNIO_API_KEY}",
             "Content-Type": "application/json"
         }
-        
+
         # Zernio API requires accountId
         if not account_id:
             logger.warning(f"⚠️ account_id is None, using fallback from settings")
             account_id = settings.ZERNIO_ACCOUNT_ID
             logger.info(f"   Fallback account_id: {account_id}")
-        
+
         # Correct Zernio payload format: {"message": "...", "accountId": "..."}
         payload = {
             "message": message_text,
             "accountId": account_id
         }
-        
+
         logger.info(f"📤 Sending DM via Zernio")
         logger.info(f"   URL: {url}")
         logger.info(f"   Final accountId in payload: {payload.get('accountId')}")
         logger.info(f"   Payload: {payload}")
-        
+
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=payload, headers=headers, timeout=10.0)
             response.raise_for_status()
             result = response.json()
-            
+
             # Extract ID from various possible response formats
             message_id = (
-                result.get("id") 
-                or result.get("message_id") 
+                result.get("id")
+                or result.get("message_id")
                 or result.get("data", {}).get("id")
                 or result.get("message", {}).get("id")
                 or "success"  # If no ID in response, return "success" indicator
             )
-            
+
             logger.info(f"✅ DM sent successfully! Response: {result}")
             return message_id
     except Exception as e:
