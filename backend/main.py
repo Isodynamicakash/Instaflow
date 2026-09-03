@@ -61,9 +61,15 @@ class InstagramAPI:
         posts were published natively in the Instagram app, not through
         Zernio's own posting flow.
 
-        KNOWN GAP: Zernio's external-post summary doesn't include like/comment
-        counts (that's a separate analytics call) — like_count/comments_count
-        are set to 0 below rather than guessed. Wire GET /v1/analytics with
+        Response shape (confirmed against a live account, 2026-09-03):
+        top-level object has content/mediaItems/status/platforms[], and the
+        Instagram-specific platformPostId/publishedAt/platformPostUrl live
+        inside platforms[] where platform == "instagram" — NOT at the top
+        level as Zernio's own SDK docs for ExternalPostSummary suggested.
+
+        KNOWN GAP: like/comment counts aren't in this response (that's a
+        separate analytics call) — like_count/comments_count are set to 0
+        below rather than guessed. Wire GET /v1/analytics with
         source=external later if the dashboard needs real engagement numbers
         here.
         """
@@ -76,21 +82,27 @@ class InstagramAPI:
             data = response.json()
             posts = data.get("posts", data.get("data", []))
             logger.info(f"✅ Fetched {len(posts)} posts from Zernio")
-            if posts:
-                logger.info(f"🔍 DEBUG — sample raw post from Zernio: {posts[0]}")
-            return [
-                {
-                    "id": p.get("platformPostId"),  # the real Instagram media id
+            result = []
+            for p in posts:
+                if p.get("status") != "published":
+                    continue
+                ig_platform = next(
+                    (pl for pl in p.get("platforms", []) if pl.get("platform") == "instagram"),
+                    None,
+                )
+                if not ig_platform or not ig_platform.get("platformPostId"):
+                    continue
+                media_items = p.get("mediaItems", [])
+                result.append({
+                    "id": ig_platform.get("platformPostId"),  # the real Instagram media id
                     "caption": p.get("content", "") or "",
-                    "timestamp": p.get("publishedAt", "") or "",
-                    "like_count": 0,   # not in this summary — see docstring
+                    "timestamp": ig_platform.get("publishedAt") or p.get("scheduledFor", "") or "",
+                    "like_count": 0,   # not in this response — see docstring
                     "comments_count": 0,
-                    "media_type": p.get("mediaType", ""),
-                    "platform_post_url": p.get("platformPostUrl"),
-                }
-                for p in posts
-                if p.get("platform") == "instagram" and p.get("platformPostId")
-            ]
+                    "media_type": media_items[0].get("type", "") if media_items else "",
+                    "platform_post_url": ig_platform.get("platformPostUrl"),
+                })
+            return result
         except Exception as e:
             logger.error(f"❌ Failed to get posts from Zernio: {e}")
             if hasattr(e, "response") and e.response is not None:
