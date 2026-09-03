@@ -82,6 +82,10 @@ class InstagramAPI:
             data = response.json()
             posts = data.get("posts", data.get("data", []))
             logger.info(f"✅ Fetched {len(posts)} posts from Zernio")
+            logger.info(f"🔍 DEBUG — statuses: {[p.get('status') for p in posts]}")
+            for p in posts:
+                ig_pf = next((pl for pl in p.get("platforms", []) if pl.get("platform") == "instagram"), None)
+                logger.info(f"🔍 DEBUG — post {p.get('_id')}: status={p.get('status')} ig_platformPostId={ig_pf.get('platformPostId') if ig_pf else 'NO IG PLATFORM ENTRY'}")
             result = []
             for p in posts:
                 if p.get("status") != "published":
