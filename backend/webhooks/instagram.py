@@ -130,11 +130,58 @@ def matches_automation_keywords(text: str, automation: dict) -> bool:
                 return True
     return False
 
+async def check_live_follow_status(account_id: str, user_id: str):
+    """Calls Zernio's on-demand follow-status endpoint for a fresh answer —
+    used specifically at button-tap time, since the tap itself is new
+    consent and may have resolved (or changed) since the original message.
+    Returns True/False/None (None = still unresolved or the call failed)."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{settings.ZERNIO_API_BASE}/v1/accounts/{account_id}/follow-status/{user_id}",
+                headers={"Authorization": f"Bearer {settings.ZERNIO_API_KEY}"},
+                timeout=10.0,
+            )
+            r.raise_for_status()
+            data = r.json()
+            return data.get("isFollower")
+    except Exception as e:
+        logger.error(f"❌ follow-status check failed for user {user_id}: {e}")
+        return None
+
+async def find_automation_by_id(automation_id: str):
+    automations = await get_active_automations()
+    for auto in automations:
+        if auto.get("id") == automation_id or auto.get("_id") == automation_id:
+            return auto
+    return None
+
+FOLLOW_CHECK_PAYLOAD_PREFIX = "instaflow_followcheck:"
+
+async def send_follow_check_prompt(conversation_id: str, sender_id: str, account_id: str, automation: dict, text: str = None):
+    """Sends the nudge text with a postback button. Tapping it re-checks
+    live follow status (see the postback handler in the webhook route) and
+    either sends the real content or loops back to this same prompt."""
+    gate = automation.get("followGate") or {}
+    body = text or gate.get("notFollowingMessage") or "Looks like you're not following yet — follow, then tap below to try again."
+    button_label = (gate.get("buttonLabel") or "I'm following ✅")[:20]  # Zernio caps button titles at 20 chars
+    await send_dm_reply(
+        conversation_id=conversation_id,
+        message_text=body,
+        sender_id=sender_id,
+        account_id=account_id,
+        buttons=[{
+            "type": "postback",
+            "title": button_label,
+            "payload": f"{FOLLOW_CHECK_PAYLOAD_PREFIX}{automation.get('id') or automation.get('_id')}",
+        }],
+    )
+
 async def maybe_send_non_follower_nudge(message_text: str, sender_obj: dict, conversation_id: str, sender_id: str, account_id: str):
     """If the sender is a CONFIRMED non-follower (isFollower is exactly
     False, not None/unresolved) and their message matches a keyword on an
     active, follower-gated flow that has a notFollowingMessage configured,
-    send that message manually. Returns True if a nudge was sent."""
+    send the nudge WITH a check-again button. Returns True if sent."""
     profile = sender_obj.get("instagramProfile") or {}
     if profile.get("isFollower") is not False:
         return False  # True (is a follower), or None (unresolved — Zernio's own gate handles this case)
@@ -154,22 +201,49 @@ async def maybe_send_non_follower_nudge(message_text: str, sender_obj: dict, con
         if audience.get("followerStatus") != "follower":
             continue
         gate = auto.get("followGate") or {}
-        nudge_text = gate.get("notFollowingMessage")
-        if not nudge_text:
+        if not gate.get("notFollowingMessage"):
             continue
         if matches_automation_keywords(message_text, auto):
             logger.info(
                 f"🔔 Confirmed non-follower matched flow '{auto.get('name')}' "
-                f"(Zernio would skip silently) — sending manual nudge"
+                f"(Zernio would skip silently) — sending nudge with check-again button"
             )
+            await send_follow_check_prompt(conversation_id, sender_id, account_id, auto)
+            return True
+    return False
+
+async def handle_follow_check_postback(payload: str, conversation_id: str, sender_id: str, account_id: str) -> bool:
+    """Handles a tap on the check-again button: re-checks live follow
+    status and either sends the real content or loops the same prompt.
+    Returns True if it handled the tap (caller should stop processing)."""
+    if not payload.startswith(FOLLOW_CHECK_PAYLOAD_PREFIX):
+        return False
+
+    automation_id = payload[len(FOLLOW_CHECK_PAYLOAD_PREFIX):]
+    automation = await find_automation_by_id(automation_id)
+    if not automation:
+        logger.warning(f"⚠️ Follow-check tap for unknown/deleted automation {automation_id} — ignoring")
+        return True
+
+    is_follower = await check_live_follow_status(account_id, sender_id)
+    logger.info(f"🔁 Follow-check tap for '{automation.get('name')}' — live status: {is_follower}")
+
+    if is_follower is True:
+        real_message = automation.get("dmMessage", "")
+        if real_message:
             await send_dm_reply(
                 conversation_id=conversation_id,
-                message_text=nudge_text,
+                message_text=real_message,
                 sender_id=sender_id,
                 account_id=account_id,
             )
-            return True
-    return False
+            logger.info("✅ Now following — sent real content")
+    else:
+        # Still not following (False) or Meta still can't resolve it (None) — loop the prompt
+        await send_follow_check_prompt(conversation_id, sender_id, account_id, automation)
+        logger.info("🔁 Still not confirmed as following — re-sent check-again prompt")
+    return True
+
 
 # ==================== WEBHOOK HANDLER ====================
 
@@ -254,11 +328,32 @@ async def handle_instagram_webhook(request: Request):
             logger.info(f"⏭️  OWN {'MESSAGE' if is_dm else 'COMMENT'} - SKIPPING (prevents infinite loop)")
             return {"status": "ok", "skipped": True, "reason": "own_message"}
 
+        # ==================== FOLLOW-CHECK BUTTON TAP (DMs only) ====================
+        # A tap on the "I'm following ✅" button we sent arrives as an
+        # ordinary message.received event, with the button's payload in
+        # message_obj.metadata.postbackPayload. Handle it before any keyword
+        # matching — the tap itself isn't a trigger word, it's a re-check.
+        if is_dm:
+            postback_payload = (message_obj.get("metadata") or {}).get("postbackPayload")
+            if postback_payload:
+                try:
+                    handled = await handle_follow_check_postback(
+                        payload=postback_payload,
+                        conversation_id=conversation_id,
+                        sender_id=sender_id,
+                        account_id=account_id,
+                    )
+                    if handled:
+                        return {"status": "ok", "event": event_type, "action": "follow_check_postback_handled"}
+                except Exception as e:
+                    logger.error(f"❌ Follow-check postback handling failed: {e}")
+
         # ==================== NON-FOLLOWER NUDGE (DMs only, fills a native gap) ====================
         # See the helper functions above for the full explanation: Zernio's own
         # audience gate silently skips CONFIRMED non-followers (isFollower ==
         # False) rather than sending notFollowingMessage, which only fires
-        # during the unresolved/verify path. This catches that gap manually.
+        # during the unresolved/verify path. This catches that gap manually,
+        # now with a check-again button instead of a dead-end text message.
         if is_dm:
             try:
                 nudged = await maybe_send_non_follower_nudge(
@@ -457,8 +552,10 @@ async def post_comment_reply(comment_id: str, reply_text: str) -> str:
         logger.error(f"❌ Failed to post comment reply: {e}")
         return None
 
-async def send_dm_reply(conversation_id: str, message_text: str, sender_id: str, account_id: str = None) -> str:
-    """Send a DM reply via Zernio"""
+async def send_dm_reply(conversation_id: str, message_text: str, sender_id: str, account_id: str = None, buttons: list = None) -> str:
+    """Send a DM reply via Zernio. Pass `buttons` (list of
+    {type, title, payload/url}, max 3) to attach inline buttons —
+    used by the follow-check prompt."""
     try:
         logger.info(f"📤 send_dm_reply called with:")
         logger.info(f"   account_id param: {account_id}")
@@ -481,6 +578,8 @@ async def send_dm_reply(conversation_id: str, message_text: str, sender_id: str,
             "message": message_text,
             "accountId": account_id
         }
+        if buttons:
+            payload["buttons"] = buttons[:3]  # Zernio caps inline buttons at 3
 
         logger.info(f"📤 Sending DM via Zernio")
         logger.info(f"   URL: {url}")
