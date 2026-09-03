@@ -21,7 +21,7 @@ import os
 
 from backend.config import settings
 from backend.webhooks.instagram import router as ig_webhook_router
-from backend.api.automations import router as automations_router
+from backend.routes.automations import router as automations_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,19 +55,44 @@ class InstagramAPI:
         self.client = httpx.AsyncClient()
 
     async def get_posts(self):
+        """Pulls posts from Zernio instead of raw Graph API — rides Zernio's
+        own OAuth connection (auto-refreshed), so IG_ACCESS_TOKEN no longer
+        needs manual rotation for this call. source=external because these
+        posts were published natively in the Instagram app, not through
+        Zernio's own posting flow.
+
+        KNOWN GAP: Zernio's external-post summary doesn't include like/comment
+        counts (that's a separate analytics call) — like_count/comments_count
+        are set to 0 below rather than guessed. Wire GET /v1/analytics with
+        source=external later if the dashboard needs real engagement numbers
+        here.
+        """
         try:
-            url = f"{self.api_base}/{self.user_id}/media"
-            params = {
-                "fields": "id,caption,timestamp,like_count,comments_count,media_type",
-                "access_token": self.access_token,
-            }
-            response = await self.client.get(url, params=params, timeout=10.0)
+            url = f"{settings.ZERNIO_API_BASE}/v1/posts"
+            headers = {"Authorization": f"Bearer {settings.ZERNIO_API_KEY}"}
+            params = {"accountId": settings.ZERNIO_ACCOUNT_ID, "source": "external", "limit": 50}
+            response = await self.client.get(url, headers=headers, params=params, timeout=10.0)
             response.raise_for_status()
             data = response.json()
-            logger.info(f"✅ Fetched {len(data.get('data', []))} posts from Instagram")
-            return data.get("data", [])
+            posts = data.get("posts", data.get("data", []))
+            logger.info(f"✅ Fetched {len(posts)} posts from Zernio")
+            return [
+                {
+                    "id": p.get("platformPostId"),  # the real Instagram media id
+                    "caption": p.get("content", "") or "",
+                    "timestamp": p.get("publishedAt", "") or "",
+                    "like_count": 0,   # not in this summary — see docstring
+                    "comments_count": 0,
+                    "media_type": p.get("mediaType", ""),
+                    "platform_post_url": p.get("platformPostUrl"),
+                }
+                for p in posts
+                if p.get("platform") == "instagram" and p.get("platformPostId")
+            ]
         except Exception as e:
-            logger.error(f"❌ Failed to get posts: {e}")
+            logger.error(f"❌ Failed to get posts from Zernio: {e}")
+            if hasattr(e, "response") and e.response is not None:
+                logger.error(f"   Response body: {e.response.text}")
             return []
 
     async def get_comments(self):
