@@ -246,6 +246,27 @@ async def debug_last_messages(conversation_id: str, limit: int = 5):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/debug/follow-status/{user_id}")
+async def debug_follow_status(user_id: str):
+    """Calls Zernio's on-demand follow-status endpoint directly and
+    returns the RAW response, unmodified — no interpretation by our code.
+    Tells us definitively whether Zernio/Meta itself is reporting stale
+    data (upstream issue) vs. our check_live_follow_status() misreading a
+    correct response (our bug). TEMPORARY — delete once resolved."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{settings.ZERNIO_API_BASE}/v1/accounts/{settings.ZERNIO_ACCOUNT_ID}/follow-status/{user_id}",
+                headers={"Authorization": f"Bearer {settings.ZERNIO_API_KEY}"},
+                timeout=15.0,
+            )
+            r.raise_for_status()
+            return {"status_code": r.status_code, "raw_response": r.json()}
+    except httpx.HTTPStatusError as e:
+        return {"status_code": e.response.status_code, "raw_response": e.response.text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ==================== POSTS (for the flow builder's scope picker) ====================
 
 @app.get("/posts")
