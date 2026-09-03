@@ -82,10 +82,6 @@ class InstagramAPI:
             data = response.json()
             posts = data.get("posts", data.get("data", []))
             logger.info(f"✅ Fetched {len(posts)} posts from Zernio")
-            logger.info(f"🔍 DEBUG — statuses: {[p.get('status') for p in posts]}")
-            for p in posts:
-                ig_pf = next((pl for pl in p.get("platforms", []) if pl.get("platform") == "instagram"), None)
-                logger.info(f"🔍 DEBUG — post {p.get('_id')}: status={p.get('status')} ig_platformPostId={ig_pf.get('platformPostId') if ig_pf else 'NO IG PLATFORM ENTRY'}")
             result = []
             for p in posts:
                 if p.get("status") != "published":
@@ -226,6 +222,30 @@ async def root():
 async def health():
     return {"status": "healthy", "service": "instaflow"}
 
+# ==================== TEMP DEBUG — remove once the button issue is resolved ====================
+
+@app.get("/debug/last-messages/{conversation_id}")
+async def debug_last_messages(conversation_id: str, limit: int = 5):
+    """Fetches raw messages straight from Zernio's storage for one
+    conversation, so we can see exactly what got stored for a sent
+    message — specifically whether `buttons` survived on Zernio's side.
+    TEMPORARY — delete this route once the button investigation is done,
+    it has no place in a shipped app."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{settings.ZERNIO_API_BASE}/v1/inbox/conversations/{conversation_id}/messages",
+                headers={"Authorization": f"Bearer {settings.ZERNIO_API_KEY}"},
+                params={"accountId": settings.ZERNIO_ACCOUNT_ID, "limit": limit, "sortOrder": "desc"},
+                timeout=15.0,
+            )
+            r.raise_for_status()
+            return r.json()
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ==================== POSTS (for the flow builder's scope picker) ====================
 
 @app.get("/posts")
@@ -247,22 +267,28 @@ async def list_posts_for_picker():
         return []
 
 @app.post("/posts/sync-external")
-async def sync_external_posts():
+async def sync_external_posts(url: str = None):
     """Manual trigger for Zernio's external-post sync (posts published
-    natively in the Instagram app, not through Zernio) instead of waiting
-    for the ~90-minute automatic background sync. Call this once, then
-    re-check GET /posts."""
+    natively in the Instagram app, not through Zernio). Without `url`, this
+    only refreshes the account's recent posts (there's an implied recency
+    cap per Zernio's own API spec). Pass `url` (the post's Instagram
+    permalink, e.g. https://www.instagram.com/p/XXXXXXX/) to target one
+    specific post directly and bypass that cap — useful when an older post
+    isn't showing up in the bulk refresh."""
     try:
+        payload = {"accountId": settings.ZERNIO_ACCOUNT_ID}
+        if url:
+            payload["url"] = url
         async with httpx.AsyncClient() as client:
             r = await client.post(
                 f"{settings.ZERNIO_API_BASE}/v1/posts/sync-external",
                 headers={"Authorization": f"Bearer {settings.ZERNIO_API_KEY}"},
-                json={"accountId": settings.ZERNIO_ACCOUNT_ID},
+                json=payload,
                 timeout=20.0,
             )
             r.raise_for_status()
             data = r.json()
-            logger.info(f"✅ External post sync triggered: {data}")
+            logger.info(f"✅ External post sync triggered (url={url}): {data}")
             return data
     except httpx.HTTPStatusError as e:
         logger.error(f"❌ Sync-external failed [{e.response.status_code}]: {e.response.text}")
