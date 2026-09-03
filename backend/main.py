@@ -1,9 +1,11 @@
 """
 InstaFlow — Complete Main Server with DM Support (FIXED)
-Webhooks + Dashboard API + DMs + Schedule Posts
+Webhooks + Dashboard API + DMs + Schedule Posts + Automations (flows)
 - Fixed DM data formatting
 - Proper timestamp parsing
 - Correct username extraction
+- Automations router added: dashboard talks to /automations, never to Zernio directly
+- /posts added: feeds the flow builder's per-post scope picker
 """
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, HTTPException, UploadFile, File
@@ -19,6 +21,7 @@ import os
 
 from backend.config import settings
 from backend.webhooks.instagram import router as ig_webhook_router
+from backend.routes.automations import router as automations_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,7 +74,7 @@ class InstagramAPI:
         try:
             posts = await self.get_posts()
             all_comments = []
-            
+
             for post in posts[:5]:
                 url = f"{self.api_base}/{post['id']}/comments"
                 params = {
@@ -82,7 +85,7 @@ class InstagramAPI:
                 if response.status_code == 200:
                     comments = response.json().get("data", [])
                     all_comments.extend(comments)
-            
+
             logger.info(f"✅ Fetched {len(all_comments)} comments")
             return all_comments
         except Exception as e:
@@ -119,11 +122,11 @@ async def lifespan(app: FastAPI):
     logger.info("="*70)
     logger.info("🚀 InstaFlow Agent — Server Started")
     logger.info(f"   Environment: {settings.ENV}")
-    logger.info(f"   Endpoints: 10+ available")
+    logger.info(f"   Endpoints: 12+ available")
     logger.info("="*70)
-    
+
     yield
-    
+
     await ig_api.close()
     logger.info("🛑 InstaFlow Agent — Server Stopped")
 
@@ -131,20 +134,21 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="InstaFlow Agent",
-    description="Real-time Instagram AI engagement agent + Advanced Dashboard",
-    version="1.0.0",
+    description="Real-time Instagram flow automation + Advanced Dashboard",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[settings.DASHBOARD_ORIGIN] if settings.DASHBOARD_ORIGIN != "*" else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 app.include_router(ig_webhook_router)
+app.include_router(automations_router)
 
 # ==================== ROOT & HEALTH ====================
 
@@ -152,7 +156,7 @@ app.include_router(ig_webhook_router)
 async def root():
     return {
         "name": "InstaFlow Agent",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "status": "running",
         "endpoints": [
             "GET /analytics",
@@ -161,6 +165,12 @@ async def root():
             "GET /analytics/demographics",
             "GET /comments (+ DMs)",
             "GET /dms",
+            "GET /posts",
+            "GET /automations",
+            "POST /automations",
+            "PATCH /automations/{id}",
+            "PATCH /automations/{id}/toggle",
+            "DELETE /automations/{id}",
             "POST /posts/schedule",
             "POST /ai/caption",
             "POST /ai/hashtags",
@@ -173,16 +183,36 @@ async def root():
 async def health():
     return {"status": "healthy", "service": "instaflow"}
 
+# ==================== POSTS (for the flow builder's scope picker) ====================
+
+@app.get("/posts")
+async def list_posts_for_picker():
+    """Feeds the dashboard flow builder's 'One specific post' picker with
+    real post ids/captions so platformPostId is a real Instagram media id."""
+    try:
+        posts = await ig_api.get_posts()
+        return [
+            {
+                "id": p.get("id"),
+                "caption": (p.get("caption", "").split("\n")[0][:60] if p.get("caption") else "Untitled post"),
+                "date": (p.get("timestamp", "") or "")[:10],
+            }
+            for p in posts
+        ]
+    except Exception as e:
+        logger.error(f"❌ Posts list error: {e}")
+        return []
+
 # ==================== ANALYTICS ====================
 
 @app.get("/analytics")
 async def get_analytics():
     try:
         posts = await ig_api.get_posts()
-        
+
         total_likes = sum(p.get("like_count", 0) for p in posts)
         total_comments = sum(p.get("comments_count", 0) for p in posts)
-        
+
         posts_data = [
             {
                 "id": p.get("id"),
@@ -193,9 +223,9 @@ async def get_analytics():
             }
             for p in posts
         ]
-        
+
         logger.info(f"📊 Analytics: {len(posts)} posts, {total_likes} likes, {total_comments} comments")
-        
+
         return {
             "totalPosts": len(posts),
             "totalLikes": total_likes,
@@ -218,11 +248,11 @@ async def get_top_hashtags():
     try:
         posts = await ig_api.get_posts()
         hashtag_performance = {}
-        
+
         for post in posts:
             caption = post.get("caption", "")
             hashtags = [tag.strip() for tag in caption.split() if tag.startswith("#")]
-            
+
             for hashtag in hashtags:
                 if hashtag not in hashtag_performance:
                     hashtag_performance[hashtag] = {
@@ -231,25 +261,25 @@ async def get_top_hashtags():
                         "total_comments": 0,
                         "avg_engagement": 0
                     }
-                
+
                 hashtag_performance[hashtag]["count"] += 1
                 hashtag_performance[hashtag]["total_likes"] += post.get("like_count", 0)
                 hashtag_performance[hashtag]["total_comments"] += post.get("comments_count", 0)
-        
+
         for tag in hashtag_performance:
             count = hashtag_performance[tag]["count"]
             hashtag_performance[tag]["avg_engagement"] = (
                 (hashtag_performance[tag]["total_likes"] + hashtag_performance[tag]["total_comments"]) / count
             ) if count > 0 else 0
-        
+
         top_hashtags = sorted(
             hashtag_performance.items(),
             key=lambda x: x[1]["avg_engagement"],
             reverse=True
         )[:10]
-        
+
         logger.info(f"🏆 Found {len(hashtag_performance)} unique hashtags")
-        
+
         return {
             "hashtags": [
                 {
@@ -273,30 +303,30 @@ async def get_top_hashtags():
 async def get_best_publishing_time():
     try:
         posts = await ig_api.get_posts()
-        
+
         time_performance = defaultdict(lambda: {"count": 0, "total_engagement": 0})
         day_performance = defaultdict(lambda: {"count": 0, "total_engagement": 0})
-        
+
         for post in posts:
             timestamp = post.get("timestamp", "")
             if not timestamp:
                 continue
-            
+
             try:
                 post_time = datetime.fromisoformat(timestamp.replace("+0000", "+00:00"))
                 hour = post_time.hour
                 day = post_time.strftime("%A")
-                
+
                 engagement = post.get("like_count", 0) + post.get("comments_count", 0)
-                
+
                 time_performance[hour]["count"] += 1
                 time_performance[hour]["total_engagement"] += engagement
-                
+
                 day_performance[day]["count"] += 1
                 day_performance[day]["total_engagement"] += engagement
             except:
                 continue
-        
+
         best_hours = []
         for hour in sorted(time_performance.keys()):
             data = time_performance[hour]
@@ -306,7 +336,7 @@ async def get_best_publishing_time():
                 "engagement": round(avg_engagement, 1),
                 "posts": data["count"]
             })
-        
+
         best_days = []
         days_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
         for day in days_order:
@@ -318,12 +348,12 @@ async def get_best_publishing_time():
                     "engagement": round(avg_engagement, 1),
                     "posts": data["count"]
                 })
-        
+
         top_hours = sorted(best_hours, key=lambda x: x["engagement"], reverse=True)[:3]
         top_days = sorted(best_days, key=lambda x: x["engagement"], reverse=True)[:3]
-        
+
         logger.info(f"⏰ Best publishing times analyzed")
-        
+
         return {
             "best_hours": top_hours,
             "best_days": top_days,
@@ -344,14 +374,14 @@ async def get_user_demographics():
             "fields": "id,username,name,followers_count,follows_count,biography,website,profile_picture_url",
             "access_token": settings.IG_ACCESS_TOKEN,
         }
-        
+
         async with httpx.AsyncClient() as client:
             response = await client.get(url, params=params, timeout=10.0)
             response.raise_for_status()
             account_data = response.json()
-        
+
         logger.info(f"📱 Retrieved account demographics")
-        
+
         return {
             "account": {
                 "username": account_data.get("username"),
@@ -374,7 +404,7 @@ async def get_comments():
     try:
         comments = await ig_api.get_comments()
         dms = await ig_api.get_conversations()
-        
+
         # Format comments
         formatted_comments = [
             {
@@ -388,7 +418,7 @@ async def get_comments():
             }
             for c in comments
         ]
-        
+
         # Format DMs (FIXED VERSION)
         formatted_dms = []
         for dm in dms:
@@ -396,27 +426,30 @@ async def get_comments():
                 # Get participant username (first participant who is NOT the account owner)
                 participants = dm.get("participants", [])
                 username = "Unknown"
-                
+                is_follower = None
+
                 if participants and len(participants) > 0:
                     for p in participants:
                         p_id = p.get("id", "")
                         if p_id and p_id != settings.IG_USER_ID:
                             username = p.get("username", "Unknown")
+                            profile = p.get("instagramProfile") or {}
+                            is_follower = profile.get("isFollower")
                             break
                     # If not found, use first participant
                     if username == "Unknown" and participants:
                         username = participants[0].get("username", "Unknown")
-                
+
                 # Get message text
                 text = dm.get("last_message", "")
                 if not text:
                     text = dm.get("message", "")
-                
+
                 # Parse timestamp properly
                 timestamp = dm.get("updated_at", "")
                 if not timestamp:
                     timestamp = dm.get("created_at", "")
-                
+
                 if timestamp:
                     try:
                         # Handle different timestamp formats
@@ -428,7 +461,7 @@ async def get_comments():
                     except Exception as ts_error:
                         logger.warning(f"⚠️ Could not parse timestamp: {timestamp} - {ts_error}")
                         timestamp = ""
-                
+
                 formatted_dms.append({
                     "id": dm.get("id", ""),
                     "username": username,
@@ -436,15 +469,16 @@ async def get_comments():
                     "timestamp": timestamp,
                     "status": "pending",
                     "type": "dm",
+                    "isFollower": is_follower,  # NEW — null when Meta hasn't revealed it (no consent yet)
                     "reply": None
                 })
             except Exception as dm_error:
                 logger.error(f"⚠️ Error formatting DM: {dm_error}")
                 continue
-        
+
         all_messages = formatted_comments + formatted_dms
         logger.info(f"💬 Retrieved {len(formatted_comments)} comments + {len(formatted_dms)} DMs")
-        
+
         return all_messages
     except Exception as e:
         logger.error(f"❌ Comments error: {e}")
@@ -478,10 +512,10 @@ async def schedule_post(request: SchedulePostRequest):
             "media": None,
             "createdAt": datetime.now().isoformat()
         }
-        
+
         scheduled_posts.append(scheduled_post)
         logger.info(f"📅 Post scheduled for {request.scheduledTime}")
-        
+
         return {
             "success": True,
             "post": scheduled_post,
@@ -512,14 +546,14 @@ async def upload_media(file: UploadFile = File(...)):
         # Save file temporarily
         upload_dir = "/tmp/instaflow_uploads"
         os.makedirs(upload_dir, exist_ok=True)
-        
+
         file_path = f"{upload_dir}/{file.filename}"
         with open(file_path, "wb") as f:
             content = await file.read()
             f.write(content)
-        
+
         logger.info(f"📸 Media uploaded: {file.filename}")
-        
+
         return {
             "success": True,
             "filename": file.filename,
@@ -531,6 +565,9 @@ async def upload_media(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=str(e))
 
 # ==================== AI ENDPOINTS ====================
+# NOTE: kept for manual caption/hashtag generation in the dashboard's post
+# composer. Unrelated to trigger automations — the conversational agent for
+# comment/DM auto-replies is disabled in webhooks/instagram.py.
 
 def get_claude_client():
     return Anthropic(api_key=settings.ANTHROPIC_API_KEY)
@@ -540,10 +577,10 @@ async def generate_caption(request: CaptionRequest):
     try:
         if not settings.ANTHROPIC_API_KEY:
             raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
-        
+
         client = get_claude_client()
-        
-        system_prompt = f"""You are an Instagram caption expert. 
+
+        system_prompt = f"""You are an Instagram caption expert.
 Your writing style: {request.writing_style or 'engaging and professional'}
 Topic focus: {request.topic or 'general'}
 
@@ -552,7 +589,7 @@ Write captions that are:
 - 100-150 characters
 - Include a clear call-to-action
 - Use relevant emojis"""
-        
+
         message = client.messages.create(
             model=settings.CLAUDE_MODEL,
             max_tokens=300,
@@ -564,10 +601,10 @@ Write captions that are:
                 }
             ]
         )
-        
+
         caption = message.content[0].text
         logger.info(f"✨ Generated caption")
-        
+
         return {
             "caption": caption,
             "model": settings.CLAUDE_MODEL,
@@ -582,9 +619,9 @@ async def generate_hashtags(request: HashtagsRequest):
     try:
         if not settings.ANTHROPIC_API_KEY:
             raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
-        
+
         client = get_claude_client()
-        
+
         message = client.messages.create(
             model=settings.CLAUDE_MODEL,
             max_tokens=200,
@@ -597,12 +634,12 @@ Example: productivity, lifestyle, entrepreneur, businessowner"""
                 }
             ]
         )
-        
+
         hashtags_text = message.content[0].text
         hashtags = [tag.strip().lstrip("#") for tag in hashtags_text.split(",") if tag.strip()]
-        
+
         logger.info(f"✨ Generated {len(hashtags)} hashtags")
-        
+
         return {
             "hashtags": hashtags,
             "count": len(hashtags),
@@ -618,7 +655,7 @@ Example: productivity, lifestyle, entrepreneur, businessowner"""
 async def websocket_analytics(websocket: WebSocket):
     await websocket.accept()
     logger.info("🔌 WebSocket connected")
-    
+
     try:
         while True:
             analytics = await get_analytics()
