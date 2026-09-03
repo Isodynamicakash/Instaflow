@@ -222,50 +222,7 @@ async def root():
 async def health():
     return {"status": "healthy", "service": "instaflow"}
 
-# ==================== TEMP DEBUG — remove once the button issue is resolved ====================
 
-@app.get("/debug/last-messages/{conversation_id}")
-async def debug_last_messages(conversation_id: str, limit: int = 5):
-    """Fetches raw messages straight from Zernio's storage for one
-    conversation, so we can see exactly what got stored for a sent
-    message — specifically whether `buttons` survived on Zernio's side.
-    TEMPORARY — delete this route once the button investigation is done,
-    it has no place in a shipped app."""
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(
-                f"{settings.ZERNIO_API_BASE}/v1/inbox/conversations/{conversation_id}/messages",
-                headers={"Authorization": f"Bearer {settings.ZERNIO_API_KEY}"},
-                params={"accountId": settings.ZERNIO_ACCOUNT_ID, "limit": limit, "sortOrder": "desc"},
-                timeout=15.0,
-            )
-            r.raise_for_status()
-            return r.json()
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/debug/follow-status/{user_id}")
-async def debug_follow_status(user_id: str):
-    """Calls Zernio's on-demand follow-status endpoint directly and
-    returns the RAW response, unmodified — no interpretation by our code.
-    Tells us definitively whether Zernio/Meta itself is reporting stale
-    data (upstream issue) vs. our check_live_follow_status() misreading a
-    correct response (our bug). TEMPORARY — delete once resolved."""
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(
-                f"{settings.ZERNIO_API_BASE}/v1/accounts/{settings.ZERNIO_ACCOUNT_ID}/follow-status/{user_id}",
-                headers={"Authorization": f"Bearer {settings.ZERNIO_API_KEY}"},
-                timeout=15.0,
-            )
-            r.raise_for_status()
-            return {"status_code": r.status_code, "raw_response": r.json()}
-    except httpx.HTTPStatusError as e:
-        return {"status_code": e.response.status_code, "raw_response": e.response.text}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 # ==================== POSTS (for the flow builder's scope picker) ====================
 
