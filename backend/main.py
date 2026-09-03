@@ -21,7 +21,7 @@ import os
 
 from backend.config import settings
 from backend.webhooks.instagram import router as ig_webhook_router
-from backend.routes.automations import router as automations_router
+from backend.api.automations import router as automations_router
 
 logging.basicConfig(
     level=logging.INFO,
