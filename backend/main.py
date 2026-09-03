@@ -21,7 +21,7 @@ import os
 
 from backend.config import settings
 from backend.webhooks.instagram import router as ig_webhook_router
-from backend.api.automations import router as automations_router
+from backend.routes.automations import router as automations_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -76,6 +76,8 @@ class InstagramAPI:
             data = response.json()
             posts = data.get("posts", data.get("data", []))
             logger.info(f"✅ Fetched {len(posts)} posts from Zernio")
+            if posts:
+                logger.info(f"🔍 DEBUG — sample raw post from Zernio: {posts[0]}")
             return [
                 {
                     "id": p.get("platformPostId"),  # the real Instagram media id
@@ -228,10 +230,38 @@ async def list_posts_for_picker():
         logger.error(f"❌ Posts list error: {e}")
         return []
 
+@app.post("/posts/sync-external")
+async def sync_external_posts():
+    """Manual trigger for Zernio's external-post sync (posts published
+    natively in the Instagram app, not through Zernio) instead of waiting
+    for the ~90-minute automatic background sync. Call this once, then
+    re-check GET /posts."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{settings.ZERNIO_API_BASE}/v1/posts/sync-external",
+                headers={"Authorization": f"Bearer {settings.ZERNIO_API_KEY}"},
+                json={"accountId": settings.ZERNIO_ACCOUNT_ID},
+                timeout=20.0,
+            )
+            r.raise_for_status()
+            data = r.json()
+            logger.info(f"✅ External post sync triggered: {data}")
+            return data
+    except httpx.HTTPStatusError as e:
+        logger.error(f"❌ Sync-external failed [{e.response.status_code}]: {e.response.text}")
+        raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+    except Exception as e:
+        logger.error(f"❌ Sync-external error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ==================== ANALYTICS ====================
 
 @app.get("/analytics")
 async def get_analytics():
+    """NOTE: like_count/comments_count are currently 0 for every post — see
+    the docstring on InstagramAPI.get_posts(). Wire the separate analytics
+    endpoint if real engagement numbers are needed here."""
     try:
         posts = await ig_api.get_posts()
 
