@@ -4,7 +4,7 @@ Thin proxy between the dashboard frontend and Zernio's comment-automations API.
 ZERNIO_API_KEY never leaves the server; the frontend only ever talks to this app.
 
 NOTE ON UNVERIFIED ENDPOINTS: the create + list shapes below are confirmed
-against Zernio's docs. The PATCH (update/toggle) and DELETE endpoints are
+against Zernio's docs. The PATCH (update/toggle) and DELETE endpoints are 
 written to the same REST convention Zernio uses everywhere else in their API
 (POST /v1/comment-automations, so PATCH/DELETE /v1/comment-automations/{id}
 is the reasonable guess) but I have not independently confirmed those two verbs
