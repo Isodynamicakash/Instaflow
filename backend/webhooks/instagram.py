@@ -267,6 +267,19 @@ async def maybe_send_non_follower_nudge(message_text: str, sender_obj: dict, con
     live_status = await check_live_follow_status(account_id, sender_id)
     logger.info(f"🔍 Live follow-status check at trigger time for flow '{matched_auto.get('name')}': {live_status}")
 
+    # RETRY-ONCE: real testing showed Zernio's follow-status endpoint can
+    # briefly disagree with the payload's own embedded isFollower value,
+    # then self-correct within seconds (observed: False -> True in ~14s
+    # for the same person, same automation, no action taken in between).
+    # If the payload already says True but our fresh check says otherwise,
+    # give it one short retry before falling back to the gate — cuts down
+    # on unnecessary gate messages for people who are already following.
+    if live_status is not True and (sender_obj.get("instagramProfile") or {}).get("isFollower") is True:
+        logger.info("🔁 Live check disagreed with payload's isFollower=True — retrying once after a short delay")
+        await asyncio.sleep(2)
+        live_status = await check_live_follow_status(account_id, sender_id)
+        logger.info(f"🔍 Retry live follow-status check: {live_status}")
+
     if live_status is True:
         real_message = matched_auto.get("dmMessage", "")
         if real_message:
