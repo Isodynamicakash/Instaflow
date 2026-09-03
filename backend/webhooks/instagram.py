@@ -82,6 +82,44 @@ async def verify_webhook(request: Request):
 _automations_cache = {"data": None, "fetched_at": 0}
 _AUTOMATIONS_CACHE_TTL = 30  # seconds — avoid hammering Zernio on bursty traffic
 
+# ==================== EVENT DEDUP ====================
+# Zernio's own docs: "Delivery is at-least-once — dedupe on the event id."
+# In-memory only — fine for a single Railway instance; if this ever runs on
+# multiple replicas, this needs to move to Redis/DB instead, since each
+# replica would otherwise have its own blind spot.
+_seen_event_ids = {}
+_EVENT_ID_TTL = 300  # 5 minutes is generous for Zernio's retry window
+
+def is_duplicate_event(event_id: str) -> bool:
+    if not event_id:
+        return False
+    now = time.monotonic()
+    # sweep occasionally so this dict doesn't grow unbounded
+    if len(_seen_event_ids) > 500:
+        for k in list(_seen_event_ids.keys()):
+            if now - _seen_event_ids[k] > _EVENT_ID_TTL:
+                del _seen_event_ids[k]
+    if event_id in _seen_event_ids and (now - _seen_event_ids[event_id]) < _EVENT_ID_TTL:
+        return True
+    _seen_event_ids[event_id] = now
+    return False
+
+# ==================== PER-FLOW GATE STATE ====================
+# Tracks, per (sender, automation) pair, whether this person has already
+# been shown THIS flow's full "Gate message". First trigger of a given
+# keyword/flow -> full gate message. Repeat triggers of the SAME flow ->
+# "If still not following" instead. A DIFFERENT flow's keyword is a fresh
+# pair, so it gets its own first-time gate message even for someone who's
+# already seen a different flow's gate. In-memory only — same limitation
+# as the automations cache: lost on restart, not shared across replicas.
+_gate_shown_to = set()
+
+def has_seen_gate(sender_id: str, automation_id: str) -> bool:
+    return (sender_id, automation_id) in _gate_shown_to
+
+def mark_gate_shown(sender_id: str, automation_id: str):
+    _gate_shown_to.add((sender_id, automation_id))
+
 async def get_active_automations() -> list:
     """Fetches the account's comment-automations from Zernio directly
     (raw shape, not the dashboard-reshaped version in api/automations.py),
@@ -180,8 +218,10 @@ async def send_follow_check_prompt(conversation_id: str, sender_id: str, account
 async def maybe_send_non_follower_nudge(message_text: str, sender_obj: dict, conversation_id: str, sender_id: str, account_id: str):
     """If the sender is a CONFIRMED non-follower (isFollower is exactly
     False, not None/unresolved) and their message matches a keyword on an
-    active, follower-gated flow that has a notFollowingMessage configured,
-    send the nudge WITH a check-again button. Returns True if sent."""
+    active, follower-gated flow, send the appropriate prompt WITH a
+    check-again button. First trigger of THIS flow -> the full gate message;
+    repeat triggers of the same flow -> the shorter notFollowingMessage.
+    Returns True if sent."""
     profile = sender_obj.get("instagramProfile") or {}
     if profile.get("isFollower") is not False:
         return False  # True (is a follower), or None (unresolved — Zernio's own gate handles this case)
@@ -201,14 +241,20 @@ async def maybe_send_non_follower_nudge(message_text: str, sender_obj: dict, con
         if audience.get("followerStatus") != "follower":
             continue
         gate = auto.get("followGate") or {}
-        if not gate.get("notFollowingMessage"):
-            continue
+        gate_message = gate.get("message")
+        not_following_message = gate.get("notFollowingMessage")
+        if not gate_message and not not_following_message:
+            continue  # nothing configured to send for this flow — skip it
         if matches_automation_keywords(message_text, auto):
+            automation_id = auto.get("id") or auto.get("_id")
+            first_time_for_this_flow = not has_seen_gate(sender_id, automation_id)
+            text_to_send = (gate_message if first_time_for_this_flow and gate_message else None) or not_following_message
             logger.info(
                 f"🔔 Confirmed non-follower matched flow '{auto.get('name')}' "
-                f"(Zernio would skip silently) — sending nudge with check-again button"
+                f"({'first time on this flow — full gate message' if first_time_for_this_flow else 'repeat on this flow — short nudge'})"
             )
-            await send_follow_check_prompt(conversation_id, sender_id, account_id, auto)
+            mark_gate_shown(sender_id, automation_id)
+            await send_follow_check_prompt(conversation_id, sender_id, account_id, auto, text=text_to_send)
             return True
     return False
 
@@ -321,6 +367,15 @@ async def handle_instagram_webhook(request: Request):
             logger.info(f"   Text: {message_text[:50]}...")
             logger.info(f"   Account: @{account_obj.get('username', 'unknown')}")
             logger.info("="*70)
+
+        # ==================== EVENT DEDUP ====================
+        # Zernio delivers at-least-once — the same event can legitimately
+        # arrive twice. Without this, the "hee"/"first follow" duplicate-send
+        # bug happens: two identical webhook deliveries for one real tap,
+        # each independently triggering a send.
+        if is_duplicate_event(message_id):
+            logger.info(f"⏭️  Duplicate event ({message_id}) — already processed, skipping")
+            return {"status": "ok", "skipped": True, "reason": "duplicate_event"}
 
         # ==================== SKIP OWN COMMENTS ====================
         # Prevent infinite loop if we reply to our own comment/DM
